@@ -1,5 +1,6 @@
 use crate::app::api::ApiApp;
 use crate::app::provider::ProviderApp;
+use crate::app::approval::ApprovalCache;
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -25,11 +26,16 @@ pub struct JsonRpcResponse {
 pub struct McpServer<'a> {
     api_app: &'a ApiApp<'a>,
     provider_app: &'a ProviderApp<'a>,
+    approval_cache: ApprovalCache,
 }
 
 impl<'a> McpServer<'a> {
     pub fn new(api_app: &'a ApiApp<'a>, provider_app: &'a ProviderApp<'a>) -> Self {
-        Self { api_app, provider_app }
+        Self { 
+            api_app, 
+            provider_app,
+            approval_cache: ApprovalCache::new(),
+        }
     }
 
     pub async fn run(&self) -> Result<()> {
@@ -57,20 +63,23 @@ impl<'a> McpServer<'a> {
                         })),
                     };
 
-                    let res_str = serde_json::to_string(&response).unwrap();
+                    let res_str = serde_json::to_string(&response)
+                        .map_err(|e| crate::error::CliError::Internal(format!("Failed to serialize response: {}", e)))?;
                     stdout.write_all(format!("{}\n", res_str).as_bytes()).await.unwrap_or_default();
                     stdout.flush().await.unwrap_or_default();
                 }
                 Err(e) => {
-                    let err_res = serde_json::json!({
-                        "jsonrpc": "2.0",
-                        "id": null,
-                        "error": {
+                    let err_res = JsonRpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id: None,
+                        result: None,
+                        error: Some(serde_json::json!({
                             "code": -32700,
                             "message": format!("Parse error: {}", e)
-                        }
-                    });
-                    let err_str = serde_json::to_string(&err_res).unwrap();
+                        })),
+                    };
+                    let err_str = serde_json::to_string(&err_res)
+                        .map_err(|e| crate::error::CliError::Internal(format!("Failed to serialize error: {}", e)))?;
                     stdout.write_all(format!("{}\n", err_str).as_bytes()).await.unwrap_or_default();
                     stdout.flush().await.unwrap_or_default();
                 }
@@ -84,7 +93,8 @@ impl<'a> McpServer<'a> {
         match req.method.as_str() {
             "list_providers" => {
                 let providers = self.provider_app.list_providers()?;
-                Ok(serde_json::to_value(providers).unwrap())
+                Ok(serde_json::to_value(providers)
+                    .map_err(|e| crate::error::CliError::Internal(format!("Serialization error: {}", e)))?)
             }
             "api_call" => {
                 let params = req.params.as_ref()
@@ -98,9 +108,17 @@ impl<'a> McpServer<'a> {
                     .ok_or_else(|| crate::error::CliError::Internal("Missing path".into()))?;
                 let body = params.get("body").cloned();
                 
-                // User approval prompt should ideally happen here, 
-                // but since it's stdio we need a separate channel or desktop GUI for prompt. 
-                // For MCP v1, we bypass interactive prompt or require it to be pre-approved.
+                // Approval check
+                if !self.approval_cache.is_approved(provider_id, method, path) {
+                    // For stdio MCP, we can't easily prompt. 
+                    // As a temporary measure, we require manual approval via CLI or a separate mechanism.
+                    // Here we just return an error asking for approval.
+                    return Err(crate::error::CliError::Internal(
+                        format!("Action required: This API call ({}: {} {}) requires manual approval. Please run 'api-cli mcp approve {} {} {}' to proceed.", 
+                        provider_id, method, path, provider_id, method, path)
+                    ));
+                }
+
                 let res = self.api_app.call(provider_id, method, path, body).await?;
                 Ok(res)
             }

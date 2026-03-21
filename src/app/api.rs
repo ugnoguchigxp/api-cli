@@ -41,7 +41,8 @@ impl<'a> ApiApp<'a> {
                 if chrono::Utc::now() + chrono::Duration::try_seconds(30).unwrap_or(chrono::Duration::zero()) >= exp {
                     tracing::info!("Token expired or expiring soon. Refreshing...");
                     if let Err(e) = self.auth_app.refresh_oauth_token(provider_id).await {
-                        tracing::warn!("Failed to refresh token automatically: {}", e);
+                        tracing::error!("Failed to refresh token: {}", e);
+                        return Err(CliError::AuthExpired);
                     } else {
                         session = self.metadata_db.get_latest_session(provider_id)?
                             .ok_or_else(|| CliError::AuthRequired)?;
@@ -58,7 +59,8 @@ impl<'a> ApiApp<'a> {
             .map_err(|_| CliError::VaultError("Invalid UTF-8 in secret".into()))?;
 
         let access_token = if provider.auth_type == crate::domain::provider::AuthType::OauthPkce {
-            let json: serde_json::Value = serde_json::from_str(&secret_str).unwrap_or_default();
+            let json: serde_json::Value = serde_json::from_str(&secret_str)
+                .map_err(|e| CliError::VaultError(format!("Malformed OAuth secret: {}", e)))?;
             json.get("access_token").and_then(|v| v.as_str()).unwrap_or("").to_string()
         } else {
             secret_str

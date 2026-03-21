@@ -9,6 +9,7 @@ pub enum CliError {
     AuthExpired,
 
     #[error("Missing vault key")]
+    #[allow(dead_code)]
     VaultKeyMissing,
 
     #[error("Vault error: {0}")]
@@ -18,6 +19,7 @@ pub enum CliError {
     ProviderNotFound(String),
 
     #[error("Provider already exists: {0}")]
+    #[allow(dead_code)]
     ProviderAlreadyExists(String),
 
     #[error("Database error: {0}")]

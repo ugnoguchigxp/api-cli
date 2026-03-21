@@ -25,7 +25,8 @@ pub fn get_vault_key_path() -> Result<PathBuf> {
     Ok(get_api_cli_dir()?.join("vault.key"))
 }
 
-pub fn get_runtime_sock_path() -> Result<PathBuf> {
+    #[allow(dead_code)]
+    pub fn get_runtime_sock_path() -> Result<PathBuf> {
     let runtime_dir = get_api_cli_dir()?.join("runtime");
     if !runtime_dir.exists() {
         fs::create_dir_all(&runtime_dir)?;

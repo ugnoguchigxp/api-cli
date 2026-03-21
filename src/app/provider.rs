@@ -19,6 +19,7 @@ impl<'a> ProviderApp<'a> {
         self.db.list_providers()
     }
 
+    #[allow(dead_code)]
     pub fn get_provider(&self, id: &str) -> Result<Option<ProviderConfig>> {
         self.db.get_provider(id)
     }

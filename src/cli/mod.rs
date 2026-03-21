@@ -5,6 +5,18 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
+
+    /// Output in JSON format
+    #[arg(long, global = true)]
+    pub json: bool,
+
+    /// Pretty print JSON output
+    #[arg(long, global = true, requires = "json")]
+    pub pretty: bool,
+
+    /// Verboase logging
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -26,9 +38,15 @@ pub enum Commands {
     },
     /// Start MCP server
     Mcp {
-        #[arg(long, default_value = "serve")]
-        action: String,
+        #[command(subcommand)]
+        cmd: McpCommands,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum McpCommands {
+    /// Run as a stdio-based MCP server
+    Serve,
 }
 
 #[derive(Subcommand, Debug)]

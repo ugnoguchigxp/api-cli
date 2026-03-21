@@ -4,6 +4,8 @@ use crate::error::{CliError, Result};
 use crate::infra::crypto::VaultCrypto;
 use crate::infra::db::{MetadataDb, VaultDb};
 use chrono::Utc;
+use uuid::Uuid;
+use rpassword;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{rngs::OsRng, RngCore};
@@ -16,6 +18,7 @@ pub struct AuthApp<'a> {
     metadata_db: &'a MetadataDb,
     vault_db: &'a VaultDb,
     crypto: &'a VaultCrypto,
+    client: Client,
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
@@ -28,10 +31,16 @@ struct TokenResponse {
 
 impl<'a> AuthApp<'a> {
     pub fn new(metadata_db: &'a MetadataDb, vault_db: &'a VaultDb, crypto: &'a VaultCrypto) -> Self {
-        Self { metadata_db, vault_db, crypto, refresh_lock: tokio::sync::Mutex::new(()) }
+        Self {
+            metadata_db,
+            vault_db,
+            crypto,
+            client: Client::new(),
+            refresh_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
-    pub fn login_api_key(&self, provider_id: &str, api_key: &str) -> Result<()> {
+    pub fn login_api_key(&self, provider_id: &str, api_key: Option<&str>) -> Result<()> {
         let provider = self.metadata_db.get_provider(provider_id)?
             .ok_or_else(|| CliError::ProviderNotFound(provider_id.to_string()))?;
 
@@ -39,13 +48,22 @@ impl<'a> AuthApp<'a> {
             return Err(CliError::Internal("Provider does not support API Key auth".into()));
         }
 
-        let secret_id = format!("apikey_{}_{}", provider_id, Utc::now().timestamp());
-        let (cipher_text, nonce) = self.crypto.encrypt(api_key.as_bytes())?;
+        let key = match api_key {
+            Some(k) => k.to_string(),
+            None => {
+                println!("Enter API Key for {}: ", provider_id);
+                rpassword::read_password()
+                    .map_err(|e| CliError::Internal(format!("Failed to read password: {}", e)))?
+            }
+        };
+
+        let secret_id = format!("apikey_{}_{}", provider_id, Uuid::new_v4());
+        let (cipher_text, nonce) = self.crypto.encrypt(key.as_bytes())?;
         
         self.vault_db.insert_secret(&secret_id, "api_key", &cipher_text, &nonce)?;
 
         let session = SessionRecord {
-            session_id: format!("sess_{}", Utc::now().timestamp()),
+            session_id: format!("sess_{}", Uuid::new_v4()),
             provider_id: provider_id.to_string(),
             scopes: provider.scopes.clone(),
             expires_at: None,
@@ -68,44 +86,67 @@ impl<'a> AuthApp<'a> {
         let auth_url = provider.auth_url.as_ref().ok_or_else(|| CliError::Internal("Missing auth_url".into()))?;
         let token_url = provider.token_url.as_ref().ok_or_else(|| CliError::Internal("Missing token_url".into()))?;
 
-        // 1. Generate state
+        // 1. Generate PKCE & state
+        let (code_verifier, code_challenge, expected_state) = self.generate_pkce_params();
+
+        // 2. Build Authorize URL
+        let redirect_uri = "http://127.0.0.1:8080/callback"; // Default for pre-registration
+        let authorize_url = self.build_authorize_url(auth_url, client_id, redirect_uri, &provider.scopes, &expected_state, &code_challenge)?;
+        
+        println!("Open this URL in your browser:\n{}\n", authorize_url);
+
+        // 3. Start callback server and wait for code
+        let (code_str, state_str) = self.start_callback_server().await?;
+
+        if state_str != expected_state {
+            return Err(CliError::Internal("CSRF token mismatch".into()));
+        }
+
+        // 4. Exchange code for token
+        let token_result = self.exchange_code_for_token(token_url, client_id, &code_str, redirect_uri, &code_verifier).await?;
+
+        // 5. Store secrets and session
+        self.store_oauth_session(provider_id, &token_result, &provider.scopes)?;
+
+        Ok(())
+    }
+
+    fn generate_pkce_params(&self) -> (String, String, String) {
         let mut state_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut state_bytes);
-        let expected_state = URL_SAFE_NO_PAD.encode(state_bytes);
+        let state = URL_SAFE_NO_PAD.encode(state_bytes);
 
-        // 2. Generate PKCE verifier
         let mut verifier_bytes = [0u8; 32];
         OsRng.fill_bytes(&mut verifier_bytes);
-        let code_verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+        let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
 
-        // 3. Generate PKCE challenge
         let mut hasher = Sha256::new();
-        hasher.update(code_verifier.as_bytes());
-        let code_challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
+        hasher.update(verifier.as_bytes());
+        let challenge = URL_SAFE_NO_PAD.encode(hasher.finalize());
 
-        let redirect_uri = "http://127.0.0.1:8080/callback";
-        let scopes = provider.scopes.join(" ");
+        (verifier, challenge, state)
+    }
 
-        let mut authorize_url = url::Url::parse(auth_url).map_err(|e| CliError::Internal(e.to_string()))?;
-        authorize_url.query_pairs_mut()
+    fn build_authorize_url(&self, auth_url: &str, client_id: &str, redirect_uri: &str, scopes: &[String], state: &str, challenge: &str) -> Result<url::Url> {
+        let mut url = url::Url::parse(auth_url).map_err(|e| CliError::Internal(e.to_string()))?;
+        let scopes_str = scopes.join(" ");
+        url.query_pairs_mut()
             .append_pair("response_type", "code")
             .append_pair("client_id", client_id)
             .append_pair("redirect_uri", redirect_uri)
-            .append_pair("scope", &scopes)
-            .append_pair("state", &expected_state)
-            .append_pair("code_challenge", &code_challenge)
+            .append_pair("scope", &scopes_str)
+            .append_pair("state", state)
+            .append_pair("code_challenge", challenge)
             .append_pair("code_challenge_method", "S256");
+        Ok(url)
+    }
 
-        println!("Open this URL in your browser:\n{}\n", authorize_url);
-        println!("Waiting for callback on {} ...", redirect_uri);
-
-        // Axum server setup
+    async fn start_callback_server(&self) -> Result<(String, String)> {
         let (tx, rx) = tokio::sync::oneshot::channel::<(String, String)>();
         let tx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
 
-        use axum::{extract::Query, response::Html, routing::get, Router};
-        let app = Router::new().route("/callback", get(move |Query(params): Query<HashMap<String, String>>| {
-            let tx = tx.clone();
+        use axum::{extract::Query, response::Html, routing::get, Router, extract::State};
+        let app = Router::new().route("/callback", get(move |Query(params): Query<HashMap<String, String>>, State(tx): State<std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(String, String)>>>>>| {
             async move {
                 let code = params.get("code").cloned().unwrap_or_default();
                 let state = params.get("state").cloned().unwrap_or_default();
@@ -114,34 +155,35 @@ impl<'a> AuthApp<'a> {
                 }
                 Html("<html><body>Authentication successful! You can close this window.</body></html>")
             }
-        }));
+        })).with_state(tx);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:8080").await
-            .map_err(|e| CliError::Internal(format!("Failed to bind to 8080: {}", e)))?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await
+            .map_err(|e| CliError::Internal(format!("Failed to bind to local port: {}", e)))?;
+        let addr = listener.local_addr().map_err(|e| CliError::Internal(e.to_string()))?;
+        let dynamic_redirect_uri = format!("http://{}/callback", addr);
+
+        println!("Waiting for callback on {} ...", dynamic_redirect_uri);
+        println!("Note: If your provider requires a fixed redirect URI, ensure {} is registered.", "http://127.0.0.1:8080/callback");
             
-        let (code_str, state_str) = tokio::select! {
+        tokio::select! {
             result = rx => {
-                result.map_err(|_| CliError::Internal("Failed to receive callback".into()))?
+                result.map_err(|_| CliError::Internal("Failed to receive callback".into()))
             }
             _ = axum::serve(listener, app) => {
-                return Err(CliError::Internal("Server exited unexpectedly".into()));
+                Err(CliError::Internal("Server exited unexpectedly".into()))
             }
-        };
-
-        if state_str != expected_state {
-            return Err(CliError::Internal("CSRF token mismatch".into()));
         }
+    }
 
-        // Exchange code for token
-        let client = Client::new();
+    async fn exchange_code_for_token(&self, token_url: &str, client_id: &str, code: &str, redirect_uri: &str, verifier: &str) -> Result<TokenResponse> {
         let mut params = HashMap::new();
         params.insert("grant_type", "authorization_code");
-        params.insert("code", &code_str);
+        params.insert("code", code);
         params.insert("redirect_uri", redirect_uri);
         params.insert("client_id", client_id);
-        params.insert("code_verifier", &code_verifier);
+        params.insert("code_verifier", verifier);
 
-        let res = client.post(token_url).form(&params).send().await
+        let res = self.client.post(token_url).form(&params).send().await
             .map_err(|e| CliError::Internal(format!("Token exchange request failed: {}", e)))?;
 
         if !res.status().is_success() {
@@ -149,17 +191,17 @@ impl<'a> AuthApp<'a> {
             return Err(CliError::Internal(format!("Token exchange failed: {}", err_text)));
         }
 
-        let token_result: TokenResponse = res.json().await
-            .map_err(|e| CliError::Internal(format!("Failed to parse token response: {}", e)))?;
+        res.json().await.map_err(|e| CliError::Internal(format!("Failed to parse token response: {}", e)))
+    }
 
-        let access_token = token_result.access_token;
+    fn store_oauth_session(&self, provider_id: &str, token_result: &TokenResponse, scopes: &[String]) -> Result<()> {
         let payload = serde_json::json!({
-            "access_token": access_token,
+            "access_token": token_result.access_token,
             "refresh_token": token_result.refresh_token
         });
         
         let secret_str = payload.to_string();
-        let secret_id = format!("oauth_{}_{}", provider_id, Utc::now().timestamp());
+        let secret_id = format!("oauth_{}_{}", provider_id, Uuid::new_v4());
         let (cipher_text, nonce) = self.crypto.encrypt(secret_str.as_bytes())?;
         
         self.vault_db.insert_secret(&secret_id, "oauth_token", &cipher_text, &nonce)?;
@@ -172,9 +214,9 @@ impl<'a> AuthApp<'a> {
         };
 
         let session = SessionRecord {
-            session_id: format!("sess_{}", Utc::now().timestamp()),
+            session_id: format!("sess_{}", Uuid::new_v4()),
             provider_id: provider_id.to_string(),
-            scopes: provider.scopes.clone(),
+            scopes: scopes.to_vec(),
             expires_at,
             secret_id,
         };
@@ -218,13 +260,12 @@ impl<'a> AuthApp<'a> {
         let client_id = provider.client_id.as_ref().ok_or_else(|| CliError::Internal("Missing client_id".into()))?;
         let token_url = provider.token_url.as_ref().ok_or_else(|| CliError::Internal("Missing token_url".into()))?;
 
-        let client = Client::new();
         let mut params = HashMap::new();
         params.insert("grant_type", "refresh_token");
         params.insert("refresh_token", refresh_token_str);
         params.insert("client_id", client_id);
 
-        let res = client.post(token_url).form(&params).send().await
+        let res = self.client.post(token_url).form(&params).send().await
             .map_err(|e| CliError::Internal(format!("Token refresh request failed: {}", e)))?;
 
         if !res.status().is_success() {

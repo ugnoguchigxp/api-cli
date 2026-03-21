@@ -16,11 +16,8 @@ pub struct VaultCrypto {
 impl VaultCrypto {
     /// Loads the vault key from the given path, or creates one if it doesn't exist
     pub fn load_or_create(key_path: &Path) -> Result<Self> {
-        if key_path.exists() {
+        if key_path.exists() && fs::metadata(key_path)?.len() == 32 {
             let key_bytes = fs::read(key_path)?;
-            if key_bytes.len() != 32 {
-                return Err(CliError::VaultError("Invalid key length".to_string()));
-            }
             let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
             Ok(Self { key: *key })
         } else {
@@ -70,5 +67,43 @@ impl VaultCrypto {
             .map_err(|e| CliError::VaultError(format!("Decryption failed: {}", e)))?;
 
         Ok(plaintext)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_encrypt_decrypt_roundtrip() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("vault.key");
+        let crypto = VaultCrypto::load_or_create(&key_path)?;
+        
+        let plaintext = b"hello world secret";
+        let (ciphertext, nonce) = crypto.encrypt(plaintext)?;
+        
+        assert_ne!(plaintext.to_vec(), ciphertext);
+        
+        let decrypted = crypto.decrypt(&ciphertext, &nonce)?;
+        assert_eq!(plaintext.to_vec(), decrypted);
+        Ok(())
+    }
+
+    #[test]
+    fn test_load_existing_key() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("vault.key");
+        
+        let crypto1 = VaultCrypto::load_or_create(&key_path)?;
+        let plaintext = b"persistent secret";
+        let (ciphertext, nonce) = crypto1.encrypt(plaintext)?;
+        
+        // Re-load
+        let crypto2 = VaultCrypto::load_or_create(&key_path)?;
+        let decrypted = crypto2.decrypt(&ciphertext, &nonce)?;
+        assert_eq!(plaintext.to_vec(), decrypted);
+        Ok(())
     }
 }

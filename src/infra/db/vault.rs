@@ -57,6 +57,7 @@ impl VaultDb {
         })
     }
 
+    #[allow(dead_code)]
     pub fn delete_secret(&self, secret_id: &str) -> Result<()> {
         tokio::task::block_in_place(|| {
             self.conn.execute("DELETE FROM secrets WHERE secret_id = ?1", params![secret_id])?;
