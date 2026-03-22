@@ -1,0 +1,49 @@
+{
+  "name": "apicli",
+  "version": "0.1.0",
+  "description": "Framework-agnostic TypeScript API client core for server backends",
+  "type": "module",
+  "license": "MIT",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsup",
+    "clean": "rimraf dist",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepublishOnly": "npm run clean && npm run typecheck && npm test && npm run build"
+  },
+  "keywords": [
+    "api",
+    "client",
+    "typescript",
+    "backend",
+    "express",
+    "nest",
+    "fastify",
+    "hono",
+    "nextjs"
+  ],
+  "devDependencies": {
+    "@types/node": "^24.7.2",
+    "rimraf": "^6.0.1",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  }
+}
