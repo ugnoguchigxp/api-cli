@@ -1,6 +1,6 @@
 use aes_gcm::{
     aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce, Key,
+    Aes256Gcm, Key, Nonce,
 };
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
@@ -29,8 +29,8 @@ impl VaultCrypto {
                 fs::create_dir_all(parent)?;
             }
 
-            fs::write(key_path, &key_bytes)?;
-            
+            fs::write(key_path, key_bytes)?;
+
             // Set permissions to 0600 on Unix
             #[cfg(unix)]
             {
@@ -46,7 +46,7 @@ impl VaultCrypto {
 
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
         let cipher = Aes256Gcm::new(&self.key);
-        
+
         let mut nonce_bytes = [0u8; 12];
         OsRng.fill_bytes(&mut nonce_bytes);
         let nonce = Nonce::from_slice(&nonce_bytes);
@@ -80,12 +80,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let key_path = dir.path().join("vault.key");
         let crypto = VaultCrypto::load_or_create(&key_path)?;
-        
+
         let plaintext = b"hello world secret";
         let (ciphertext, nonce) = crypto.encrypt(plaintext)?;
-        
+
         assert_ne!(plaintext.to_vec(), ciphertext);
-        
+
         let decrypted = crypto.decrypt(&ciphertext, &nonce)?;
         assert_eq!(plaintext.to_vec(), decrypted);
         Ok(())
@@ -99,11 +99,54 @@ mod tests {
         let crypto1 = VaultCrypto::load_or_create(&key_path)?;
         let plaintext = b"persistent secret";
         let (ciphertext, nonce) = crypto1.encrypt(plaintext)?;
-        
+
         // Re-load
         let crypto2 = VaultCrypto::load_or_create(&key_path)?;
         let decrypted = crypto2.decrypt(&ciphertext, &nonce)?;
         assert_eq!(plaintext.to_vec(), decrypted);
+        Ok(())
+    }
+
+    #[test]
+    fn test_recreate_when_existing_key_has_invalid_length() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("vault.key");
+        fs::write(&key_path, b"too-short")?;
+
+        let crypto = VaultCrypto::load_or_create(&key_path)?;
+        assert_eq!(fs::metadata(&key_path)?.len(), 32);
+
+        let (ciphertext, nonce) = crypto.encrypt(b"ok")?;
+        let decrypted = crypto.decrypt(&ciphertext, &nonce)?;
+        assert_eq!(decrypted, b"ok");
+        Ok(())
+    }
+
+    #[test]
+    fn test_decrypt_fails_when_nonce_is_tampered() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("vault.key");
+        let crypto = VaultCrypto::load_or_create(&key_path)?;
+
+        let (ciphertext, mut nonce) = crypto.encrypt(b"secret")?;
+        nonce[0] ^= 0b0000_0001;
+
+        let err = crypto.decrypt(&ciphertext, &nonce).expect_err("decrypt should fail");
+        assert!(matches!(err, CliError::VaultError(_)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_decrypt_fails_when_ciphertext_is_tampered() -> Result<()> {
+        let dir = tempdir().unwrap();
+        let key_path = dir.path().join("vault.key");
+        let crypto = VaultCrypto::load_or_create(&key_path)?;
+
+        let (mut ciphertext, nonce) = crypto.encrypt(b"secret")?;
+        ciphertext[0] ^= 0b0000_0001;
+
+        let err = crypto.decrypt(&ciphertext, &nonce).expect_err("decrypt should fail");
+        assert!(matches!(err, CliError::VaultError(_)));
         Ok(())
     }
 }

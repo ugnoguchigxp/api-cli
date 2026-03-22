@@ -6,7 +6,7 @@ mod infra;
 mod mcp;
 
 use clap::Parser;
-use cli::{Cli, Commands, ProviderCommands, AuthCommands, ApiCommands, McpCommands};
+use cli::{ApiCommands, AuthCommands, Cli, Commands, McpCommands, ProviderCommands};
 use infra::config;
 use infra::crypto::VaultCrypto;
 use infra::db::{MetadataDb, VaultDb};
@@ -17,11 +17,7 @@ async fn main() -> anyhow::Result<()> {
     let cli_args = Cli::parse();
 
     // ログレベル設定
-    let log_level = if cli_args.verbose {
-        "debug"
-    } else {
-        "info"
-    };
+    let log_level = if cli_args.verbose { "debug" } else { "info" };
 
     // ログ出力を常に stderr に向けることで、stdoutのJSON-RPCの混入を防ぐ
     tracing_subscriber::fmt()
@@ -47,7 +43,15 @@ async fn main() -> anyhow::Result<()> {
     match cli_args.command {
         Commands::Provider { cmd } => {
             match cmd {
-                ProviderCommands::Add { id, base_url, auth_type, scopes, client_id, auth_url, token_url } => {
+                ProviderCommands::Add {
+                    id,
+                    base_url,
+                    auth_type,
+                    scopes,
+                    client_id,
+                    auth_url,
+                    token_url,
+                } => {
                     let auth_t = match auth_type.as_str() {
                         "api-key" => domain::provider::AuthType::ApiKey,
                         _ => domain::provider::AuthType::OauthPkce,
@@ -56,7 +60,9 @@ async fn main() -> anyhow::Result<()> {
                         id: id.clone(),
                         base_url,
                         auth_type: auth_t,
-                        scopes: scopes.map(|s| s.split(',').map(|x| x.to_string()).collect()).unwrap_or_default(),
+                        scopes: scopes
+                            .map(|s| s.split(',').map(|x| x.to_string()).collect())
+                            .unwrap_or_default(),
                         client_id,
                         auth_url,
                         token_url,
@@ -86,36 +92,45 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Auth { cmd } => {
-            match cmd {
-                AuthCommands::Login { provider_id, api_key } => {
-                    let provider = metadata_db.get_provider(&provider_id)?
-                        .ok_or_else(|| crate::error::CliError::ProviderNotFound(provider_id.clone()))?;
+        Commands::Auth { cmd } => match cmd {
+            AuthCommands::Login {
+                provider_id,
+                api_key,
+            } => {
+                let provider = metadata_db
+                    .get_provider(&provider_id)?
+                    .ok_or_else(|| crate::error::CliError::ProviderNotFound(provider_id.clone()))?;
 
-                    if provider.auth_type == domain::provider::AuthType::ApiKey {
-                        auth_app.login_api_key(&provider_id, api_key.as_deref())?;
-                        println!("Logged in to '{}' via API Key.", provider_id);
-                    } else {
-                        if let Err(e) = auth_app.login_oauth_pkce(&provider_id).await {
-                            eprintln!("Login failed: {}", e);
-                        }
-                    }
-                }
-                AuthCommands::Status { provider_id } => {
-                    if let Ok(Some(session)) = metadata_db.get_latest_session(&provider_id) {
-                        println!("Logged in: Session Active (expires: {:?})", session.expires_at);
-                    } else {
-                        println!("Not logged in.");
-                    }
+                if provider.auth_type == domain::provider::AuthType::ApiKey {
+                    auth_app.login_api_key(&provider_id, api_key.as_deref())?;
+                    println!("Logged in to '{}' via API Key.", provider_id);
+                } else if let Err(e) = auth_app.login_oauth_pkce(&provider_id).await {
+                    eprintln!("Login failed: {}", e);
                 }
             }
-        }
+            AuthCommands::Status { provider_id } => {
+                if let Ok(Some(session)) = metadata_db.get_latest_session(&provider_id) {
+                    println!(
+                        "Logged in: Session Active (expires: {:?})",
+                        session.expires_at
+                    );
+                } else {
+                    println!("Not logged in.");
+                }
+            }
+        },
         Commands::Api { cmd } => {
             match cmd {
-                ApiCommands::Call { provider_id, method, path, body } => {
+                ApiCommands::Call {
+                    provider_id,
+                    method,
+                    path,
+                    body,
+                } => {
                     let json_body = if let Some(b) = body {
-                        Some(serde_json::from_str(&b)
-                            .map_err(|e| crate::error::CliError::Internal(format!("Invalid JSON body: {}", e)))?)
+                        Some(serde_json::from_str(&b).map_err(|e| {
+                            crate::error::CliError::Internal(format!("Invalid JSON body: {}", e))
+                        })?)
                     } else {
                         None
                     };
@@ -148,16 +163,14 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Commands::Mcp { cmd } => {
-            match cmd {
-                McpCommands::Serve => {
-                    let mcp_server = mcp::McpServer::new(&api_app, &provider_app);
-                    if let Err(e) = mcp_server.run().await {
-                        tracing::error!("MCP Server error: {}", e);
-                    }
+        Commands::Mcp { cmd } => match cmd {
+            McpCommands::Serve => {
+                let mcp_server = mcp::McpServer::new(&api_app, &provider_app);
+                if let Err(e) = mcp_server.run().await {
+                    tracing::error!("MCP Server error: {}", e);
                 }
             }
-        }
+        },
     }
 
     Ok(())

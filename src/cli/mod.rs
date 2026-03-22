@@ -95,3 +95,99 @@ pub enum ApiCommands {
         body: Option<String>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_provider_add_command() {
+        let cli = Cli::try_parse_from([
+            "api-cli",
+            "provider",
+            "add",
+            "--id",
+            "openai",
+            "--base-url",
+            "https://api.example.com",
+            "--auth-type",
+            "oauth-pkce",
+            "--scopes",
+            "read,write",
+            "--client-id",
+            "client-1",
+            "--auth-url",
+            "https://id.example.com/auth",
+            "--token-url",
+            "https://id.example.com/token",
+        ])
+        .expect("parse provider add");
+
+        match cli.command {
+            Commands::Provider { cmd: ProviderCommands::Add { id, base_url, auth_type, scopes, client_id, auth_url, token_url } } => {
+                assert_eq!(id, "openai");
+                assert_eq!(base_url, "https://api.example.com");
+                assert_eq!(auth_type, "oauth-pkce");
+                assert_eq!(scopes.as_deref(), Some("read,write"));
+                assert_eq!(client_id.as_deref(), Some("client-1"));
+                assert_eq!(auth_url.as_deref(), Some("https://id.example.com/auth"));
+                assert_eq!(token_url.as_deref(), Some("https://id.example.com/token"));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parses_api_call_with_body_and_global_flags() {
+        let cli = Cli::try_parse_from([
+            "api-cli",
+            "--json",
+            "--pretty",
+            "--verbose",
+            "api",
+            "call",
+            "provider-1",
+            "POST",
+            "/v1/chat",
+            "--body",
+            "{\"x\":1}",
+        ])
+        .expect("parse api call");
+
+        assert!(cli.json);
+        assert!(cli.pretty);
+        assert!(cli.verbose);
+
+        match cli.command {
+            Commands::Api { cmd: ApiCommands::Call { provider_id, method, path, body } } => {
+                assert_eq!(provider_id, "provider-1");
+                assert_eq!(method, "POST");
+                assert_eq!(path, "/v1/chat");
+                assert_eq!(body.as_deref(), Some("{\"x\":1}"));
+            }
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn pretty_flag_requires_json_flag() {
+        let err = Cli::try_parse_from(["api-cli", "--pretty", "provider", "list"])
+            .expect_err("pretty without json should fail");
+        let err_text = err.to_string();
+        assert!(err_text.contains("--json"));
+    }
+
+    #[test]
+    fn parses_mcp_serve_command() {
+        let cli = Cli::try_parse_from(["api-cli", "mcp", "serve"]).expect("parse mcp serve");
+        assert!(!cli.json);
+        assert!(!cli.pretty);
+        assert!(!cli.verbose);
+
+        match cli.command {
+            Commands::Mcp { cmd: McpCommands::Serve } => {}
+            _ => panic!("unexpected command variant"),
+        }
+    }
+}

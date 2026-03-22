@@ -32,3 +32,24 @@ impl ApprovalCache {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ApprovalCache;
+
+    #[test]
+    fn is_approved_returns_false_by_default() {
+        let cache = ApprovalCache::new();
+        assert!(!cache.is_approved("p1", "GET", "/v1/test"));
+    }
+
+    #[test]
+    fn approve_marks_endpoint_as_approved() {
+        let cache = ApprovalCache::new();
+        cache.approve("p1", "GET", "/v1/test");
+
+        assert!(cache.is_approved("p1", "GET", "/v1/test"));
+        assert!(!cache.is_approved("p1", "POST", "/v1/test"));
+        assert!(!cache.is_approved("p2", "GET", "/v1/test"));
+    }
+}

@@ -1,7 +1,7 @@
-use rusqlite::{params, Connection};
 use crate::domain::provider::ProviderConfig;
 use crate::domain::session::SessionRecord;
 use crate::error::Result;
+use rusqlite::{params, Connection};
 
 pub struct MetadataDb {
     conn: Connection,
@@ -28,15 +28,16 @@ impl MetadataDb {
              CREATE TABLE IF NOT EXISTS schema_version (
                  version INTEGER PRIMARY KEY,
                  applied_at TEXT
-             );"
+             );",
         )?;
         Ok(Self { conn })
     }
 
     pub fn insert_provider(&self, provider: &ProviderConfig) -> Result<()> {
         tokio::task::block_in_place(|| {
-            let json = serde_json::to_string(provider)
-                .map_err(|e| crate::error::CliError::Internal(format!("Failed to serialize provider: {}", e)))?;
+            let json = serde_json::to_string(provider).map_err(|e| {
+                crate::error::CliError::Internal(format!("Failed to serialize provider: {}", e))
+            })?;
             let now = chrono::Utc::now().to_rfc3339();
             self.conn.execute(
                 "INSERT INTO providers (id, config_json, created_at, updated_at)
@@ -50,12 +51,18 @@ impl MetadataDb {
 
     pub fn get_provider(&self, id: &str) -> Result<Option<ProviderConfig>> {
         tokio::task::block_in_place(|| {
-            let mut stmt = self.conn.prepare("SELECT config_json FROM providers WHERE id = ?1")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT config_json FROM providers WHERE id = ?1")?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
                 let json: String = row.get(0)?;
-                let provider = serde_json::from_str(&json)
-                    .map_err(|e| crate::error::CliError::Internal(format!("Failed to deserialize provider: {}", e)))?;
+                let provider = serde_json::from_str(&json).map_err(|e| {
+                    crate::error::CliError::Internal(format!(
+                        "Failed to deserialize provider: {}",
+                        e
+                    ))
+                })?;
                 Ok(Some(provider))
             } else {
                 Ok(None)
@@ -65,14 +72,21 @@ impl MetadataDb {
 
     pub fn list_providers(&self) -> Result<Vec<ProviderConfig>> {
         tokio::task::block_in_place(|| {
-            let mut stmt = self.conn.prepare("SELECT config_json FROM providers ORDER BY id")?;
+            let mut stmt = self
+                .conn
+                .prepare("SELECT config_json FROM providers ORDER BY id")?;
             let items = stmt.query_map([], |row| {
                 let json: String = row.get(0)?;
-                let provider: ProviderConfig = serde_json::from_str(&json)
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e)))?;
+                let provider: ProviderConfig = serde_json::from_str(&json).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
                 Ok(provider)
             })?;
-            
+
             let mut providers = Vec::new();
             for item in items {
                 providers.push(item?);
@@ -83,18 +97,20 @@ impl MetadataDb {
 
     pub fn delete_provider(&self, id: &str) -> Result<()> {
         tokio::task::block_in_place(|| {
-            self.conn.execute("DELETE FROM providers WHERE id = ?1", params![id])?;
+            self.conn
+                .execute("DELETE FROM providers WHERE id = ?1", params![id])?;
             Ok(())
         })
     }
 
     pub fn insert_session(&self, session: &SessionRecord) -> Result<()> {
         tokio::task::block_in_place(|| {
-            let json = serde_json::to_string(session)
-                .map_err(|e| crate::error::CliError::Internal(format!("Failed to serialize session: {}", e)))?;
+            let json = serde_json::to_string(session).map_err(|e| {
+                crate::error::CliError::Internal(format!("Failed to serialize session: {}", e))
+            })?;
             let expires_at = session.expires_at.map(|d| d.to_rfc3339());
             let now = chrono::Utc::now().to_rfc3339();
-            
+
             self.conn.execute(
                 "INSERT INTO sessions (session_id, provider_id, config_json, expires_at, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?5)
@@ -107,18 +123,24 @@ impl MetadataDb {
 
     #[allow(dead_code)]
     pub fn get_session(&self, session_id: &str) -> Result<Option<SessionRecord>> {
-         tokio::task::block_in_place(|| {
-             let mut stmt = self.conn.prepare("SELECT config_json FROM sessions WHERE session_id = ?1")?;
-             let mut rows = stmt.query(params![session_id])?;
-             if let Some(row) = rows.next()? {
-                 let json: String = row.get(0)?;
-                 let session = serde_json::from_str(&json)
-                    .map_err(|e| crate::error::CliError::Internal(format!("Failed to deserialize session: {}", e)))?;
-                 Ok(Some(session))
-             } else {
-                 Ok(None)
-             }
-         })
+        tokio::task::block_in_place(|| {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT config_json FROM sessions WHERE session_id = ?1")?;
+            let mut rows = stmt.query(params![session_id])?;
+            if let Some(row) = rows.next()? {
+                let json: String = row.get(0)?;
+                let session = serde_json::from_str(&json).map_err(|e| {
+                    crate::error::CliError::Internal(format!(
+                        "Failed to deserialize session: {}",
+                        e
+                    ))
+                })?;
+                Ok(Some(session))
+            } else {
+                Ok(None)
+            }
+        })
     }
 
     pub fn get_latest_session(&self, provider_id: &str) -> Result<Option<SessionRecord>> {
@@ -128,8 +150,12 @@ impl MetadataDb {
             let mut rows = stmt.query(params![provider_id])?;
             if let Some(row) = rows.next()? {
                 let json: String = row.get(0)?;
-                let session = serde_json::from_str(&json)
-                    .map_err(|e| crate::error::CliError::Internal(format!("Failed to deserialize session: {}", e)))?;
+                let session = serde_json::from_str(&json).map_err(|e| {
+                    crate::error::CliError::Internal(format!(
+                        "Failed to deserialize session: {}",
+                        e
+                    ))
+                })?;
                 Ok(Some(session))
             } else {
                 Ok(None)
@@ -139,10 +165,13 @@ impl MetadataDb {
 
     #[allow(dead_code)]
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
-         tokio::task::block_in_place(|| {
-             self.conn.execute("DELETE FROM sessions WHERE session_id = ?1", params![session_id])?;
-             Ok(())
-         })
+        tokio::task::block_in_place(|| {
+            self.conn.execute(
+                "DELETE FROM sessions WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            Ok(())
+        })
     }
 }
 
@@ -150,6 +179,7 @@ impl MetadataDb {
 mod tests {
     use super::*;
     use crate::domain::provider::AuthType;
+    use chrono::Utc;
 
     fn setup_db() -> MetadataDb {
         let conn = Connection::open_in_memory().unwrap();
@@ -200,12 +230,116 @@ mod tests {
         };
 
         db.insert_session(&s1).unwrap();
-        // Wait a bit or manually ensure timestamp order if needed, 
+        // Wait a bit or manually ensure timestamp order if needed,
         // but normally successive inserts have increasing timestamps in our impl
         std::thread::sleep(std::time::Duration::from_millis(10));
         db.insert_session(&s2).unwrap();
 
         let latest = db.get_latest_session("p1").unwrap().unwrap();
         assert_eq!(latest.session_id, "s2");
+    }
+
+    #[test]
+    fn test_get_provider_returns_none_for_missing() {
+        let db = setup_db();
+        assert!(db.get_provider("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_list_providers_is_sorted_by_id() {
+        let db = setup_db();
+        let p1 = ProviderConfig {
+            id: "zeta".into(),
+            base_url: "https://z.example.com".into(),
+            auth_type: AuthType::ApiKey,
+            client_id: None,
+            auth_url: None,
+            token_url: None,
+            scopes: vec![],
+        };
+        let p2 = ProviderConfig {
+            id: "alpha".into(),
+            base_url: "https://a.example.com".into(),
+            auth_type: AuthType::ApiKey,
+            client_id: None,
+            auth_url: None,
+            token_url: None,
+            scopes: vec![],
+        };
+        db.insert_provider(&p1).unwrap();
+        db.insert_provider(&p2).unwrap();
+
+        let list = db.list_providers().unwrap();
+        let ids: Vec<String> = list.into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    #[test]
+    fn test_insert_provider_upserts_by_id() {
+        let db = setup_db();
+        let mut provider = ProviderConfig {
+            id: "dup".into(),
+            base_url: "https://v1.example.com".into(),
+            auth_type: AuthType::ApiKey,
+            client_id: None,
+            auth_url: None,
+            token_url: None,
+            scopes: vec!["read".into()],
+        };
+        db.insert_provider(&provider).unwrap();
+
+        provider.base_url = "https://v2.example.com".into();
+        provider.scopes = vec!["write".into()];
+        db.insert_provider(&provider).unwrap();
+
+        let got = db.get_provider("dup").unwrap().unwrap();
+        assert_eq!(got.base_url, "https://v2.example.com");
+        assert_eq!(got.scopes, vec!["write".to_string()]);
+    }
+
+    #[test]
+    fn test_get_and_delete_session() {
+        let db = setup_db();
+        let s1 = SessionRecord {
+            session_id: "s1".into(),
+            provider_id: "p1".into(),
+            scopes: vec!["read".into()],
+            expires_at: Some(Utc::now()),
+            secret_id: "sec1".into(),
+        };
+        db.insert_session(&s1).unwrap();
+
+        let fetched = db.get_session("s1").unwrap().unwrap();
+        assert_eq!(fetched.secret_id, "sec1");
+
+        db.delete_session("s1").unwrap();
+        assert!(db.get_session("s1").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_get_latest_session_returns_none_when_no_session() {
+        let db = setup_db();
+        assert!(db.get_latest_session("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn test_insert_session_upserts_by_session_id() {
+        let db = setup_db();
+        let mut s1 = SessionRecord {
+            session_id: "sess".into(),
+            provider_id: "p1".into(),
+            scopes: vec!["read".into()],
+            expires_at: None,
+            secret_id: "sec1".into(),
+        };
+        db.insert_session(&s1).unwrap();
+
+        s1.secret_id = "sec2".into();
+        s1.expires_at = Some(Utc::now());
+        db.insert_session(&s1).unwrap();
+
+        let fetched = db.get_session("sess").unwrap().unwrap();
+        assert_eq!(fetched.secret_id, "sec2");
+        assert!(fetched.expires_at.is_some());
     }
 }
