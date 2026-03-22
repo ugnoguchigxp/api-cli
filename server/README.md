@@ -161,6 +161,8 @@ export async function GET(request: Request) {
 ```bash
 npm run build
 npm run typecheck
+npm run lint
+npm run test:coverage
 npm test
 ```
 

@@ -24,9 +24,14 @@
     "build": "tsup",
     "clean": "rimraf dist",
     "typecheck": "tsc --noEmit",
+    "lint": "biome lint .",
+    "format": "biome format --check .",
+    "format:write": "biome format --write .",
+    "check": "biome check .",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
-    "prepublishOnly": "npm run clean && npm run typecheck && npm test && npm run build"
+    "prepublishOnly": "npm run clean && npm run typecheck && npm run lint && npm run test:coverage && npm run build"
   },
   "keywords": [
     "api",
@@ -40,7 +45,9 @@
     "nextjs"
   ],
   "devDependencies": {
+    "@biomejs/biome": "^2.4.8",
     "@types/node": "^24.7.2",
+    "@vitest/coverage-v8": "^3.2.4",
     "rimraf": "^6.0.1",
     "tsup": "^8.5.0",
     "typescript": "^5.9.3",

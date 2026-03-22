@@ -1,7 +1,7 @@
-import { createBearerAuthAdapter, createStaticProviderResolver } from './adapters';
-import { ApiClient } from './client';
-import { createContextFromNodeRequest, createContextFromWebRequest } from './context';
-import { ApiCliError, ApiCliHttpError } from './errors';
+import { createBearerAuthAdapter, createStaticProviderResolver } from "./adapters";
+import { ApiClient } from "./client";
+import { createContextFromNodeRequest, createContextFromWebRequest } from "./context";
+import { ApiCliError, ApiCliHttpError } from "./errors";
 import type {
   ApiCallRequest,
   ApiCallResponse,
@@ -12,20 +12,20 @@ import type {
   ProviderResolver,
   QueryValue,
   RequestContext,
-  ResponseParseMode
-} from './types';
+  ResponseParseMode,
+} from "./types";
 
 const DEFAULT_ALLOWED_METHODS: HttpMethod[] = [
-  'GET',
-  'POST',
-  'PUT',
-  'DELETE',
-  'PATCH',
-  'HEAD',
-  'OPTIONS'
+  "GET",
+  "POST",
+  "PUT",
+  "DELETE",
+  "PATCH",
+  "HEAD",
+  "OPTIONS",
 ];
 
-const DEFAULT_FORWARD_HEADERS = ['x-request-id', 'x-tenant-id', 'x-user-id'];
+const DEFAULT_FORWARD_HEADERS = ["x-request-id", "x-tenant-id", "x-user-id"];
 
 type NodeHeaderValue = string | string[] | undefined;
 
@@ -52,16 +52,16 @@ export interface NodeLikeResponse {
 
 export type ProxyAuthConfig =
   | {
-      mode?: 'none';
+      mode?: "none";
     }
   | {
-      mode: 'static-bearer';
+      mode: "static-bearer";
       token: string;
       headerName?: string;
       scheme?: string;
     }
   | {
-      mode: 'forward-header';
+      mode: "forward-header";
       sourceHeaderName?: string;
       targetHeaderName?: string;
       passthrough?: boolean;
@@ -86,13 +86,13 @@ export interface ApiProxyServerConfig {
   contextResolver?: (
     input:
       | {
-          kind: 'web';
+          kind: "web";
           request: Request;
         }
       | {
-          kind: 'node';
+          kind: "node";
           request: NodeLikeRequest;
-        }
+        },
   ) => RequestContext | undefined | Promise<RequestContext | undefined>;
   allowTargetPath?: (input: {
     providerId: string;
@@ -111,27 +111,27 @@ interface SerializedResponse {
 type QueryMultiMap = Record<string, string[]>;
 
 function normalizeRoutePrefix(prefix: string | undefined): string {
-  const fallback = '/apicli';
+  const fallback = "/apicli";
   const raw = prefix && prefix.trim().length > 0 ? prefix.trim() : fallback;
-  if (raw === '/') {
-    return '/';
+  if (raw === "/") {
+    return "/";
   }
 
-  let normalized = raw.startsWith('/') ? raw : `/${raw}`;
-  if (normalized.endsWith('/')) {
+  let normalized = raw.startsWith("/") ? raw : `/${raw}`;
+  if (normalized.endsWith("/")) {
     normalized = normalized.slice(0, -1);
   }
   return normalized;
 }
 
 function stripRoutePrefix(pathname: string, routePrefix: string): string {
-  const normalizedPath = pathname.startsWith('/') ? pathname : `/${pathname}`;
-  if (routePrefix === '/') {
+  const normalizedPath = pathname.startsWith("/") ? pathname : `/${pathname}`;
+  if (routePrefix === "/") {
     return normalizedPath;
   }
 
   if (normalizedPath === routePrefix) {
-    return '/';
+    return "/";
   }
 
   if (normalizedPath.startsWith(`${routePrefix}/`)) {
@@ -146,7 +146,10 @@ function stripRoutePrefix(pathname: string, routePrefix: string): string {
   return normalizedPath;
 }
 
-function getHeaderValue(headers: Headers | NodeLikeHeaders, headerName: string): string | undefined {
+function getHeaderValue(
+  headers: Headers | NodeLikeHeaders,
+  headerName: string,
+): string | undefined {
   if (headers instanceof Headers) {
     return headers.get(headerName) ?? undefined;
   }
@@ -168,7 +171,7 @@ function getHeaderValue(headers: Headers | NodeLikeHeaders, headerName: string):
 
 function pickForwardHeaders(
   headers: Headers | NodeLikeHeaders,
-  allowList: string[]
+  allowList: string[],
 ): Record<string, string> {
   const picked: Record<string, string> = {};
 
@@ -241,7 +244,7 @@ function firstQueryValue(map: QueryMultiMap, key: string): string | undefined {
 
 function buildOutboundQuery(
   queryMap: QueryMultiMap,
-  reservedKeys: Set<string>
+  reservedKeys: Set<string>,
 ): Record<string, QueryValue> | undefined {
   const outbound: Record<string, QueryValue> = {};
 
@@ -265,10 +268,10 @@ function buildOutboundQuery(
 
 function normalizeTargetPath(path: string): string {
   if (!path) {
-    return '/';
+    return "/";
   }
 
-  if (path.startsWith('/')) {
+  if (path.startsWith("/")) {
     return path;
   }
 
@@ -285,7 +288,7 @@ function mergeContext(base: RequestContext, extra: RequestContext | undefined): 
   if (base.metadata || extra.metadata) {
     merged.metadata = {
       ...(base.metadata ?? {}),
-      ...(extra.metadata ?? {})
+      ...(extra.metadata ?? {}),
     };
   }
 
@@ -299,13 +302,13 @@ function statusFromError(error: unknown): number {
 
   if (error instanceof ApiCliError) {
     switch (error.code) {
-      case 'PROVIDER_NOT_FOUND':
+      case "PROVIDER_NOT_FOUND":
         return 404;
-      case 'BAD_REQUEST':
+      case "BAD_REQUEST":
         return 400;
-      case 'METHOD_NOT_ALLOWED':
+      case "METHOD_NOT_ALLOWED":
         return 405;
-      case 'TIMEOUT':
+      case "TIMEOUT":
         return 504;
       default:
         return 502;
@@ -328,17 +331,17 @@ function serializeErrorResponse(error: unknown): SerializedResponse {
           ...(error.details ?? {}),
           upstreamStatus: error.status,
           upstreamBody: error.responseText,
-          upstreamHeaders: error.responseHeaders
-        }
-      }
+          upstreamHeaders: error.responseHeaders,
+        },
+      },
     });
 
     return {
       status,
       headers: {
-        'content-type': 'application/json; charset=utf-8'
+        "content-type": "application/json; charset=utf-8",
       },
-      body
+      body,
     };
   }
 
@@ -348,63 +351,65 @@ function serializeErrorResponse(error: unknown): SerializedResponse {
       error: {
         code: error.code,
         message: error.message,
-        details: error.details ?? null
-      }
+        details: error.details ?? null,
+      },
     });
 
     return {
       status,
       headers: {
-        'content-type': 'application/json; charset=utf-8'
+        "content-type": "application/json; charset=utf-8",
       },
-      body
+      body,
     };
   }
 
   const body = JSON.stringify({
     ok: false,
     error: {
-      code: 'INTERNAL',
-      message: error instanceof Error ? error.message : 'Unexpected error'
-    }
+      code: "INTERNAL",
+      message: error instanceof Error ? error.message : "Unexpected error",
+    },
   });
 
   return {
     status,
     headers: {
-      'content-type': 'application/json; charset=utf-8'
+      "content-type": "application/json; charset=utf-8",
     },
-    body
+    body,
   };
 }
 
-async function serializeSuccessResponse(result: ApiCallResponse<unknown>): Promise<SerializedResponse> {
+async function serializeSuccessResponse(
+  result: ApiCallResponse<unknown>,
+): Promise<SerializedResponse> {
   const headers: Record<string, string> = {};
-  const contentType = result.headers['content-type'] ?? result.headers['Content-Type'];
+  const contentType = result.headers["content-type"] ?? result.headers["Content-Type"];
 
   if (result.data instanceof Response) {
     const responseHeaders = Object.fromEntries(result.data.headers.entries());
     return {
       status: result.data.status,
       headers: responseHeaders,
-      body: await result.data.text()
+      body: await result.data.text(),
     };
   }
 
-  if (typeof result.data === 'string') {
-    headers['content-type'] = contentType ?? 'text/plain; charset=utf-8';
+  if (typeof result.data === "string") {
+    headers["content-type"] = contentType ?? "text/plain; charset=utf-8";
     return {
       status: result.status,
       headers,
-      body: result.data
+      body: result.data,
     };
   }
 
-  headers['content-type'] = contentType ?? 'application/json; charset=utf-8';
+  headers["content-type"] = contentType ?? "application/json; charset=utf-8";
   return {
     status: result.status,
     headers,
-    body: JSON.stringify(result.data)
+    body: JSON.stringify(result.data),
   };
 }
 
@@ -413,8 +418,8 @@ function nodeRequestPathname(request: NodeLikeRequest): string {
     return request.path;
   }
 
-  const rawUrl = request.originalUrl ?? request.url ?? '/';
-  return new URL(rawUrl, 'http://localhost').pathname;
+  const rawUrl = request.originalUrl ?? request.url ?? "/";
+  return new URL(rawUrl, "http://localhost").pathname;
 }
 
 function nodeRequestQuery(request: NodeLikeRequest): QueryMultiMap {
@@ -427,12 +432,12 @@ function nodeRequestQuery(request: NodeLikeRequest): QueryMultiMap {
     return {};
   }
 
-  const parsed = new URL(rawUrl, 'http://localhost');
+  const parsed = new URL(rawUrl, "http://localhost");
   return queryMapFromSearchParams(parsed.searchParams);
 }
 
 function isBodylessMethod(method: HttpMethod): boolean {
-  return method === 'GET' || method === 'HEAD';
+  return method === "GET" || method === "HEAD";
 }
 
 async function parseWebBody(request: Request, method: HttpMethod): Promise<unknown | undefined> {
@@ -445,8 +450,8 @@ async function parseWebBody(request: Request, method: HttpMethod): Promise<unkno
     return undefined;
   }
 
-  const contentType = request.headers.get('content-type')?.toLowerCase() ?? '';
-  if (contentType.includes('application/json')) {
+  const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
+  if (contentType.includes("application/json")) {
     try {
       return JSON.parse(raw);
     } catch {
@@ -460,7 +465,7 @@ async function parseWebBody(request: Request, method: HttpMethod): Promise<unkno
 function parseNodeBody(
   body: unknown,
   method: HttpMethod,
-  headers: NodeLikeHeaders | undefined
+  headers: NodeLikeHeaders | undefined,
 ): unknown | undefined {
   if (isBodylessMethod(method)) {
     return undefined;
@@ -470,11 +475,11 @@ function parseNodeBody(
     return undefined;
   }
 
-  if (typeof body === 'string') {
+  if (typeof body === "string") {
     const contentType = headers
-      ? (getHeaderValue(headers, 'content-type') ?? '').toLowerCase()
-      : '';
-    if (contentType.includes('application/json')) {
+      ? (getHeaderValue(headers, "content-type") ?? "").toLowerCase()
+      : "";
+    if (contentType.includes("application/json")) {
       try {
         return JSON.parse(body);
       } catch {
@@ -492,11 +497,11 @@ function resolveAuthAdapter(config: ApiProxyServerConfig): AuthAdapter | undefin
   }
 
   const auth = config.auth;
-  if (!auth || auth.mode === 'none' || auth.mode === undefined) {
+  if (!auth || auth.mode === "none" || auth.mode === undefined) {
     return undefined;
   }
 
-  if (auth.mode === 'static-bearer') {
+  if (auth.mode === "static-bearer") {
     const options: { headerName?: string; scheme?: string } = {};
     if (auth.headerName !== undefined) {
       options.headerName = auth.headerName;
@@ -505,20 +510,17 @@ function resolveAuthAdapter(config: ApiProxyServerConfig): AuthAdapter | undefin
       options.scheme = auth.scheme;
     }
 
-    return createBearerAuthAdapter(
-      () => auth.token,
-      options
-    );
+    return createBearerAuthAdapter(() => auth.token, options);
   }
 
-  if (auth.mode !== 'forward-header') {
+  if (auth.mode !== "forward-header") {
     return undefined;
   }
 
-  const sourceHeaderName = auth.sourceHeaderName ?? 'authorization';
+  const sourceHeaderName = auth.sourceHeaderName ?? "authorization";
   const targetHeaderName = auth.targetHeaderName ?? sourceHeaderName;
   const passthrough = auth.passthrough ?? true;
-  const scheme = auth.scheme ?? 'Bearer';
+  const scheme = auth.scheme ?? "Bearer";
 
   return {
     async resolveAuthHeader({ context }) {
@@ -550,20 +552,20 @@ function resolveAuthAdapter(config: ApiProxyServerConfig): AuthAdapter | undefin
       if (passthrough) {
         return {
           headerName: targetHeaderName,
-          headerValue
+          headerValue,
         };
       }
 
-      const token = headerValue.replace(/^Bearer\s+/i, '').trim();
+      const token = headerValue.replace(/^Bearer\s+/i, "").trim();
       if (!token) {
         return null;
       }
 
       return {
         headerName: targetHeaderName,
-        headerValue: `${scheme} ${token}`
+        headerValue: `${scheme} ${token}`,
       };
-    }
+    },
   };
 }
 
@@ -573,7 +575,7 @@ function resolveProviderResolver(config: ApiProxyServerConfig): ProviderResolver
   }
 
   if (!config.providers) {
-    throw new Error('Either providers or providerResolver must be provided');
+    throw new Error("Either providers or providerResolver must be provided");
   }
 
   return createStaticProviderResolver(config.providers);
@@ -582,51 +584,55 @@ function resolveProviderResolver(config: ApiProxyServerConfig): ProviderResolver
 function ensureAllowedMethod(method: HttpMethod, config: ApiProxyServerConfig): void {
   const allowed = config.allowedMethods ?? DEFAULT_ALLOWED_METHODS;
   if (!allowed.includes(method)) {
-    throw new ApiCliError('METHOD_NOT_ALLOWED', `Method not allowed: ${method}`);
+    throw new ApiCliError("METHOD_NOT_ALLOWED", `Method not allowed: ${method}`);
   }
 }
 
 function resolveTarget(
   pathname: string,
   query: QueryMultiMap,
-  config: ApiProxyServerConfig
+  config: ApiProxyServerConfig,
 ): {
   providerId: string;
   targetPath: string;
   outboundQuery: Record<string, QueryValue> | undefined;
 } {
-  const providerKey = config.providerQueryParam ?? 'provider';
-  const pathKey = config.pathQueryParam ?? 'path';
+  const providerKey = config.providerQueryParam ?? "provider";
+  const pathKey = config.pathQueryParam ?? "path";
 
   const trimmedPath = stripRoutePrefix(pathname, normalizeRoutePrefix(config.routePrefix));
   const segments = trimmedPath
-    .split('/')
+    .split("/")
     .map((seg) => seg.trim())
     .filter((seg) => seg.length > 0);
 
   const providerFromQuery = firstQueryValue(query, providerKey);
   const providerId = providerFromQuery ?? segments.shift() ?? config.defaultProviderId;
   if (!providerId) {
-    throw new ApiCliError('BAD_REQUEST', `Missing provider id. Use path '/:providerId/*' or query '${providerKey}'.`);
+    throw new ApiCliError(
+      "BAD_REQUEST",
+      `Missing provider id. Use path '/:providerId/*' or query '${providerKey}'.`,
+    );
   }
 
   const pathFromQuery = firstQueryValue(query, pathKey);
-  const targetPath = normalizeTargetPath(pathFromQuery ?? segments.join('/'));
+  const targetPath = normalizeTargetPath(pathFromQuery ?? segments.join("/"));
 
   const outboundQuery = buildOutboundQuery(query, new Set([providerKey, pathKey]));
   return {
     providerId,
     targetPath,
-    outboundQuery
+    outboundQuery,
   };
 }
 
 function buildHeaderContextOptions(config: ApiProxyServerConfig): HeaderContextOptions {
   const options: HeaderContextOptions = {
-    ...(config.headerContext ?? {})
+    ...(config.headerContext ?? {}),
   };
 
-  const shouldIncludeRaw = config.headerContext?.includeRawHeadersInMetadata ?? config.auth?.mode === 'forward-header';
+  const shouldIncludeRaw =
+    config.headerContext?.includeRawHeadersInMetadata ?? config.auth?.mode === "forward-header";
   if (shouldIncludeRaw) {
     options.includeRawHeadersInMetadata = true;
   }
@@ -634,7 +640,10 @@ function buildHeaderContextOptions(config: ApiProxyServerConfig): HeaderContextO
   return options;
 }
 
-function sendSerializedNodeResponse(response: NodeLikeResponse, serialized: SerializedResponse): void {
+function sendSerializedNodeResponse(
+  response: NodeLikeResponse,
+  serialized: SerializedResponse,
+): void {
   if (response.status) {
     response.status(serialized.status);
   } else {
@@ -645,8 +654,8 @@ function sendSerializedNodeResponse(response: NodeLikeResponse, serialized: Seri
     response.setHeader?.(key, value);
   }
 
-  const contentType = serialized.headers['content-type']?.toLowerCase() ?? '';
-  if (contentType.includes('application/json') && response.json) {
+  const contentType = serialized.headers["content-type"]?.toLowerCase() ?? "";
+  if (contentType.includes("application/json") && response.json) {
     try {
       response.json(JSON.parse(serialized.body));
       return;
@@ -670,7 +679,7 @@ export interface ApiProxyServer {
   createExpressMiddleware(): (
     req: NodeLikeRequest,
     res: NodeLikeResponse,
-    next?: (error?: unknown) => void
+    next?: (error?: unknown) => void,
   ) => Promise<void>;
   createFastifyHandler(): (request: NodeLikeRequest, reply: NodeLikeResponse) => Promise<void>;
   createNestHandler(): (request: NodeLikeRequest, response: NodeLikeResponse) => Promise<void>;
@@ -693,7 +702,7 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
     fetchImpl?: typeof fetch;
     defaultTimeoutMs?: number;
   } = {
-    providerResolver: resolveProviderResolver(config)
+    providerResolver: resolveProviderResolver(config),
   };
 
   const authAdapter = resolveAuthAdapter(config);
@@ -720,11 +729,15 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
     try {
       const method = toHttpMethod(input.method);
       if (!method) {
-        throw new ApiCliError('METHOD_NOT_ALLOWED', `Unsupported method: ${input.method ?? ''}`);
+        throw new ApiCliError("METHOD_NOT_ALLOWED", `Unsupported method: ${input.method ?? ""}`);
       }
       ensureAllowedMethod(method, config);
 
-      const { providerId, targetPath, outboundQuery } = resolveTarget(input.pathname, input.query, config);
+      const { providerId, targetPath, outboundQuery } = resolveTarget(
+        input.pathname,
+        input.query,
+        config,
+      );
 
       if (
         config.allowTargetPath &&
@@ -732,15 +745,15 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
           providerId,
           targetPath,
           method,
-          context: input.context
+          context: input.context,
         })
       ) {
-        throw new ApiCliError('BAD_REQUEST', `Target path is not allowed: ${targetPath}`);
+        throw new ApiCliError("BAD_REQUEST", `Target path is not allowed: ${targetPath}`);
       }
 
       const forwardHeaders = pickForwardHeaders(
         input.headers,
-        config.forwardHeaders ?? DEFAULT_FORWARD_HEADERS
+        config.forwardHeaders ?? DEFAULT_FORWARD_HEADERS,
       );
 
       const request: ApiCallRequest = {
@@ -748,7 +761,7 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
         method,
         path: targetPath,
         headers: forwardHeaders,
-        context: input.context
+        context: input.context,
       };
       if (outboundQuery !== undefined) {
         request.query = outboundQuery;
@@ -774,34 +787,34 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
 
     const contextBase = createContextFromWebRequest(request, buildHeaderContextOptions(config));
     const contextExtra = config.contextResolver
-      ? await config.contextResolver({ kind: 'web', request })
+      ? await config.contextResolver({ kind: "web", request })
       : undefined;
     const context = mergeContext(contextBase, contextExtra);
 
-    const body = await parseWebBody(request, toHttpMethod(request.method) ?? 'GET');
+    const body = await parseWebBody(request, toHttpMethod(request.method) ?? "GET");
     const serialized = await executeProxy({
       method: request.method,
       pathname: url.pathname,
       query,
       headers: request.headers,
       body,
-      context
+      context,
     });
 
     return new Response(serialized.body, {
       status: serialized.status,
-      headers: serialized.headers
+      headers: serialized.headers,
     });
   };
 
   const handleNodeRequest = async (request: NodeLikeRequest): Promise<SerializedResponse> => {
-    const method = toHttpMethod(request.method) ?? 'GET';
+    const method = toHttpMethod(request.method) ?? "GET";
     const contextBase = createContextFromNodeRequest(
       { headers: request.headers ?? {} },
-      buildHeaderContextOptions(config)
+      buildHeaderContextOptions(config),
     );
     const contextExtra = config.contextResolver
-      ? await config.contextResolver({ kind: 'node', request })
+      ? await config.contextResolver({ kind: "node", request })
       : undefined;
     const context = mergeContext(contextBase, contextExtra);
 
@@ -811,7 +824,7 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
       query: nodeRequestQuery(request),
       headers: request.headers ?? {},
       body: parseNodeBody(request.body, method, request.headers),
-      context
+      context,
     });
   };
 
@@ -819,7 +832,7 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
     return async (
       req: NodeLikeRequest,
       res: NodeLikeResponse,
-      next?: (error?: unknown) => void
+      next?: (error?: unknown) => void,
     ): Promise<void> => {
       try {
         const serialized = await handleNodeRequest(req);
@@ -863,7 +876,7 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
       DELETE: handler,
       PATCH: handler,
       HEAD: handler,
-      OPTIONS: handler
+      OPTIONS: handler,
     };
   };
 
@@ -875,6 +888,6 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
     createFastifyHandler,
     createNestHandler,
     createHonoHandler,
-    createNextRouteHandlers
+    createNextRouteHandlers,
   };
 }

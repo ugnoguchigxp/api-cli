@@ -1,11 +1,11 @@
 export type ApiCliErrorCode =
-  | 'PROVIDER_NOT_FOUND'
-  | 'FETCH_ERROR'
-  | 'TIMEOUT'
-  | 'INVALID_RESPONSE'
-  | 'BAD_REQUEST'
-  | 'METHOD_NOT_ALLOWED'
-  | 'HTTP_ERROR';
+  | "PROVIDER_NOT_FOUND"
+  | "FETCH_ERROR"
+  | "TIMEOUT"
+  | "INVALID_RESPONSE"
+  | "BAD_REQUEST"
+  | "METHOD_NOT_ALLOWED"
+  | "HTTP_ERROR";
 
 export class ApiCliError extends Error {
   public readonly code: ApiCliErrorCode;
@@ -15,10 +15,10 @@ export class ApiCliError extends Error {
     code: ApiCliErrorCode,
     message: string,
     details?: Record<string, unknown>,
-    options?: ErrorOptions
+    options?: ErrorOptions,
   ) {
     super(message, options);
-    this.name = 'ApiCliError';
+    this.name = "ApiCliError";
     this.code = code;
     if (details !== undefined) {
       this.details = details;
@@ -38,8 +38,8 @@ export class ApiCliHttpError extends ApiCliError {
     responseHeaders: Record<string, string>;
     details?: Record<string, unknown>;
   }) {
-    super('HTTP_ERROR', input.message, input.details);
-    this.name = 'ApiCliHttpError';
+    super("HTTP_ERROR", input.message, input.details);
+    this.name = "ApiCliHttpError";
     this.status = input.status;
     this.responseText = input.responseText;
     this.responseHeaders = input.responseHeaders;

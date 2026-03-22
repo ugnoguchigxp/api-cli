@@ -1,4 +1,4 @@
-import type { HeaderContextOptions, RequestContext } from './types';
+import type { HeaderContextOptions, RequestContext } from "./types";
 
 type HeaderMap = Headers | Record<string, string | string[] | undefined>;
 
@@ -7,7 +7,8 @@ function getHeaderValue(headers: HeaderMap, headerName: string): string | undefi
     return headers.get(headerName) ?? undefined;
   }
 
-  const direct = headers[headerName] ?? headers[headerName.toLowerCase()] ?? headers[headerName.toUpperCase()];
+  const direct =
+    headers[headerName] ?? headers[headerName.toLowerCase()] ?? headers[headerName.toUpperCase()];
   if (Array.isArray(direct)) {
     return direct[0];
   }
@@ -16,11 +17,11 @@ function getHeaderValue(headers: HeaderMap, headerName: string): string | undefi
 
 export function createContextFromHeaders(
   headers: HeaderMap,
-  options: HeaderContextOptions = {}
+  options: HeaderContextOptions = {},
 ): RequestContext {
-  const tenantIdHeader = options.tenantIdHeader ?? 'x-tenant-id';
-  const userIdHeader = options.userIdHeader ?? 'x-user-id';
-  const requestIdHeader = options.requestIdHeader ?? 'x-request-id';
+  const tenantIdHeader = options.tenantIdHeader ?? "x-tenant-id";
+  const userIdHeader = options.userIdHeader ?? "x-user-id";
+  const requestIdHeader = options.requestIdHeader ?? "x-request-id";
 
   const tenantId = getHeaderValue(headers, tenantIdHeader);
   const userId = getHeaderValue(headers, userIdHeader);
@@ -39,7 +40,7 @@ export function createContextFromHeaders(
 
   if (options.includeRawHeadersInMetadata) {
     context.metadata = {
-      headers: headers instanceof Headers ? Object.fromEntries(headers.entries()) : headers
+      headers: headers instanceof Headers ? Object.fromEntries(headers.entries()) : headers,
     };
   }
 
@@ -48,14 +49,14 @@ export function createContextFromHeaders(
 
 export function createContextFromWebRequest(
   request: Request,
-  options: HeaderContextOptions = {}
+  options: HeaderContextOptions = {},
 ): RequestContext {
   return createContextFromHeaders(request.headers, options);
 }
 
 export function createContextFromNodeRequest(
   request: { headers: Record<string, string | string[] | undefined> },
-  options: HeaderContextOptions = {}
+  options: HeaderContextOptions = {},
 ): RequestContext {
   return createContextFromHeaders(request.headers, options);
 }

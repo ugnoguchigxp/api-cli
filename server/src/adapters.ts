@@ -3,8 +3,8 @@ import type {
   ProviderConfig,
   ProviderResolver,
   RequestContext,
-  ResolvedAuthHeader
-} from './types';
+  ResolvedAuthHeader,
+} from "./types";
 
 export interface StaticProviderResolverOptions {
   onNotFound?: (providerId: string, context?: RequestContext) => void | Promise<void>;
@@ -12,7 +12,7 @@ export interface StaticProviderResolverOptions {
 
 export function createStaticProviderResolver(
   providers: Record<string, ProviderConfig>,
-  options: StaticProviderResolverOptions = {}
+  options: StaticProviderResolverOptions = {},
 ): ProviderResolver {
   return async (providerId, context) => {
     const provider = providers[providerId];
@@ -31,19 +31,17 @@ export interface BearerAuthAdapterOptions {
   scheme?: string;
 }
 
-export type AccessTokenResolver = (
-  input: {
-    provider: ProviderConfig;
-    context?: RequestContext;
-  }
-) => Promise<string | null | undefined> | string | null | undefined;
+export type AccessTokenResolver = (input: {
+  provider: ProviderConfig;
+  context?: RequestContext;
+}) => Promise<string | null | undefined> | string | null | undefined;
 
 export function createBearerAuthAdapter(
   resolveAccessToken: AccessTokenResolver,
-  options: BearerAuthAdapterOptions = {}
+  options: BearerAuthAdapterOptions = {},
 ): AuthAdapter {
-  const headerName = options.headerName ?? 'authorization';
-  const scheme = options.scheme ?? 'Bearer';
+  const headerName = options.headerName ?? "authorization";
+  const scheme = options.scheme ?? "Bearer";
 
   return {
     async resolveAuthHeader(input): Promise<ResolvedAuthHeader | null> {
@@ -53,8 +51,8 @@ export function createBearerAuthAdapter(
       }
       return {
         headerName,
-        headerValue: `${scheme} ${token}`
+        headerValue: `${scheme} ${token}`,
       };
-    }
+    },
   };
 }

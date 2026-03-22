@@ -1,16 +1,9 @@
 export type Primitive = string | number | boolean | null;
 export type QueryValue = Primitive | Primitive[];
 
-export type HttpMethod =
-  | 'GET'
-  | 'POST'
-  | 'PUT'
-  | 'DELETE'
-  | 'PATCH'
-  | 'HEAD'
-  | 'OPTIONS';
+export type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH" | "HEAD" | "OPTIONS";
 
-export type ResponseParseMode = 'auto' | 'json' | 'text' | 'raw';
+export type ResponseParseMode = "auto" | "json" | "text" | "raw";
 
 export interface RequestContext {
   tenantId?: string;
@@ -28,7 +21,7 @@ export interface ProviderConfig {
 
 export type ProviderResolver = (
   providerId: string,
-  context?: RequestContext
+  context?: RequestContext,
 ) => ProviderConfig | null | undefined | Promise<ProviderConfig | null | undefined>;
 
 export interface ResolvedAuthHeader {

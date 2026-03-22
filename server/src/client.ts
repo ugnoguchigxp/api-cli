@@ -1,14 +1,14 @@
-import { ApiCliError, ApiCliHttpError } from './errors';
+import { ApiCliError, ApiCliHttpError } from "./errors";
 import type {
   ApiCallRequest,
   ApiCallResponse,
   ApiClientOptions,
   QueryValue,
-  ResponseParseMode
-} from './types';
+  ResponseParseMode,
+} from "./types";
 
 function isBodyInitLike(value: unknown): value is BodyInit {
-  if (typeof value === 'string') {
+  if (typeof value === "string") {
     return true;
   }
 
@@ -16,11 +16,11 @@ function isBodyInitLike(value: unknown): value is BodyInit {
     return true;
   }
 
-  if (typeof FormData !== 'undefined' && value instanceof FormData) {
+  if (typeof FormData !== "undefined" && value instanceof FormData) {
     return true;
   }
 
-  if (typeof Blob !== 'undefined' && value instanceof Blob) {
+  if (typeof Blob !== "undefined" && value instanceof Blob) {
     return true;
   }
 
@@ -56,31 +56,31 @@ function appendQueryParams(url: URL, query?: Record<string, QueryValue | undefin
 }
 
 function normalizeUrl(baseUrl: string, path: string): URL {
-  const normalizedPath = path.startsWith('/') ? path : `/${path}`;
-  return new URL(`${baseUrl.replace(/\/$/, '')}${normalizedPath}`);
+  const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  return new URL(`${baseUrl.replace(/\/$/, "")}${normalizedPath}`);
 }
 
 async function parseResponse(response: Response, mode: ResponseParseMode): Promise<unknown> {
-  if (mode === 'raw') {
+  if (mode === "raw") {
     return response;
   }
 
-  if (mode === 'text') {
+  if (mode === "text") {
     return response.text();
   }
 
-  if (mode === 'json') {
+  if (mode === "json") {
     try {
       return await response.json();
     } catch (error) {
-      throw new ApiCliError('INVALID_RESPONSE', 'Failed to parse JSON response', undefined, {
-        cause: error
+      throw new ApiCliError("INVALID_RESPONSE", "Failed to parse JSON response", undefined, {
+        cause: error,
       });
     }
   }
 
-  const contentType = response.headers.get('content-type')?.toLowerCase() ?? '';
-  if (contentType.includes('application/json')) {
+  const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+  if (contentType.includes("application/json")) {
     try {
       return await response.json();
     } catch {
@@ -92,8 +92,8 @@ async function parseResponse(response: Response, mode: ResponseParseMode): Promi
 }
 
 export class ApiClient {
-  private readonly providerResolver: ApiClientOptions['providerResolver'];
-  private readonly authAdapter?: ApiClientOptions['authAdapter'];
+  private readonly providerResolver: ApiClientOptions["providerResolver"];
+  private readonly authAdapter?: ApiClientOptions["authAdapter"];
   private readonly fetchImpl: typeof fetch;
   private readonly defaultTimeoutMs: number;
 
@@ -107,7 +107,7 @@ export class ApiClient {
   async call<T = unknown>(request: ApiCallRequest): Promise<ApiCallResponse<T>> {
     const provider = await this.providerResolver(request.providerId, request.context);
     if (!provider) {
-      throw new ApiCliError('PROVIDER_NOT_FOUND', `Provider not found: ${request.providerId}`);
+      throw new ApiCliError("PROVIDER_NOT_FOUND", `Provider not found: ${request.providerId}`);
     }
 
     const url = normalizeUrl(provider.baseUrl, request.path);
@@ -120,9 +120,7 @@ export class ApiClient {
 
     if (this.authAdapter) {
       const resolved = await this.authAdapter.resolveAuthHeader(
-        request.context !== undefined
-          ? { provider, context: request.context }
-          : { provider }
+        request.context !== undefined ? { provider, context: request.context } : { provider },
       );
       if (resolved) {
         headers.set(resolved.headerName, resolved.headerValue);
@@ -134,8 +132,8 @@ export class ApiClient {
       if (isBodyInitLike(request.body)) {
         body = request.body;
       } else {
-        if (!headers.has('content-type')) {
-          headers.set('content-type', 'application/json');
+        if (!headers.has("content-type")) {
+          headers.set("content-type", "application/json");
         }
         body = JSON.stringify(request.body);
       }
@@ -150,7 +148,7 @@ export class ApiClient {
         method: request.method,
         headers,
         body: body ?? null,
-        signal: controller.signal
+        signal: controller.signal,
       });
 
       const raw = response.clone();
@@ -164,34 +162,34 @@ export class ApiClient {
           details: {
             providerId: request.providerId,
             url: url.toString(),
-            method: request.method
-          }
+            method: request.method,
+          },
         });
       }
 
-      const mode = request.parseAs ?? 'auto';
+      const mode = request.parseAs ?? "auto";
       const data = (await parseResponse(response, mode)) as T;
       return {
         status: response.status,
         headers: headersToObject(response.headers),
         data,
-        raw
+        raw,
       };
     } catch (error) {
       if (error instanceof ApiCliError) {
         throw error;
       }
 
-      if (error instanceof DOMException && error.name === 'AbortError') {
-        throw new ApiCliError('TIMEOUT', `Request timed out after ${timeoutMs}ms`, {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        throw new ApiCliError("TIMEOUT", `Request timed out after ${timeoutMs}ms`, {
           providerId: request.providerId,
           path: request.path,
-          timeoutMs
+          timeoutMs,
         });
       }
 
-      throw new ApiCliError('FETCH_ERROR', 'Network request failed', undefined, {
-        cause: error instanceof Error ? error : undefined
+      throw new ApiCliError("FETCH_ERROR", "Network request failed", undefined, {
+        cause: error instanceof Error ? error : undefined,
       });
     } finally {
       clearTimeout(timeout);
