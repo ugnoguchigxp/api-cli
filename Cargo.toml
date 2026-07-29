@@ -1,7 +1,8 @@
 [package]
 name = "api-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.88"
 
 [dependencies]
 # CLI / async
@@ -11,7 +12,11 @@ tokio = { version = "1.37", features = ["full"] }
 # Serialize / HTTP
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.9"
+serde_jcs = "0.2"
+jsonschema = { version = "0.33", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rmcp = { version = "3.0.0", default-features = false, features = ["client", "server", "transport-io", "transport-streamable-http-server", "request-state", "elicitation"] }
 
 # DB / Crypto
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -33,8 +38,10 @@ url = "2.5"
 sha2 = "0.10"
 base64 = "0.22"
 axum = "0.7"
+tower-http = { version = "0.6", features = ["cors", "limit"] }
 rpassword = "7.3"
 uuid = { version = "1.8", features = ["v4"] }
+hex = "0.4"
 
 [dev-dependencies]
 tempfile = "3.10"

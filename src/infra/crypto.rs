@@ -4,11 +4,12 @@ use aes_gcm::{
 };
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::Write;
 use std::path::Path;
 
 use crate::error::{CliError, Result};
 
+#[derive(Clone)]
 pub struct VaultCrypto {
     key: Key<Aes256Gcm>,
 }
@@ -16,8 +17,27 @@ pub struct VaultCrypto {
 impl VaultCrypto {
     /// Loads the vault key from the given path, or creates one if it doesn't exist
     pub fn load_or_create(key_path: &Path) -> Result<Self> {
-        if key_path.exists() && fs::metadata(key_path)?.len() == 32 {
+        if key_path.exists() {
+            let metadata = fs::symlink_metadata(key_path)?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(CliError::VaultError(
+                    "Vault key must be a regular file, not a symlink".into(),
+                ));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    fs::set_permissions(key_path, fs::Permissions::from_mode(0o600))?;
+                }
+            }
             let key_bytes = fs::read(key_path)?;
+            if key_bytes.len() != 32 {
+                return Err(CliError::VaultError(format!(
+                    "Vault key has invalid length {}; refusing to replace it",
+                    key_bytes.len()
+                )));
+            }
             let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
             Ok(Self { key: *key })
         } else {
@@ -29,15 +49,22 @@ impl VaultCrypto {
                 fs::create_dir_all(parent)?;
             }
 
-            fs::write(key_path, key_bytes)?;
-
-            // Set permissions to 0600 on Unix
             #[cfg(unix)]
-            {
-                let mut perms = fs::metadata(key_path)?.permissions();
-                perms.set_mode(0o600);
-                fs::set_permissions(key_path, perms)?;
-            }
+            let mut key_file = {
+                use std::os::unix::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(key_path)?
+            };
+            #[cfg(not(unix))]
+            let mut key_file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(key_path)?;
+            key_file.write_all(&key_bytes)?;
+            key_file.sync_all()?;
 
             let key = Key::<Aes256Gcm>::from_slice(&key_bytes);
             Ok(Self { key: *key })
@@ -59,6 +86,12 @@ impl VaultCrypto {
     }
 
     pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8]) -> Result<Vec<u8>> {
+        if nonce.len() != 12 {
+            return Err(CliError::VaultError(format!(
+                "Invalid AES-GCM nonce length: {}",
+                nonce.len()
+            )));
+        }
         let cipher = Aes256Gcm::new(&self.key);
         let nonce = Nonce::from_slice(nonce);
 
@@ -80,6 +113,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let key_path = dir.path().join("vault.key");
         let crypto = VaultCrypto::load_or_create(&key_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&key_path)?.permissions().mode() & 0o777, 0o600);
+        }
 
         let plaintext = b"hello world secret";
         let (ciphertext, nonce) = crypto.encrypt(plaintext)?;
@@ -95,7 +133,7 @@ mod tests {
     fn test_load_existing_key() -> Result<()> {
         let dir = tempdir().unwrap();
         let key_path = dir.path().join("vault.key");
-        
+
         let crypto1 = VaultCrypto::load_or_create(&key_path)?;
         let plaintext = b"persistent secret";
         let (ciphertext, nonce) = crypto1.encrypt(plaintext)?;
@@ -107,18 +145,39 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
     #[test]
-    fn test_recreate_when_existing_key_has_invalid_length() -> Result<()> {
+    fn existing_key_permissions_are_tightened_and_symlinks_are_rejected() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = tempdir()?;
+        let key_path = dir.path().join("vault.key");
+        fs::write(&key_path, [7_u8; 32])?;
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644))?;
+        VaultCrypto::load_or_create(&key_path)?;
+        assert_eq!(fs::metadata(&key_path)?.permissions().mode() & 0o777, 0o600);
+
+        let symlink_path = dir.path().join("linked.key");
+        symlink(&key_path, &symlink_path)?;
+        assert!(matches!(
+            VaultCrypto::load_or_create(&symlink_path),
+            Err(CliError::VaultError(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_reject_existing_key_with_invalid_length() -> Result<()> {
         let dir = tempdir().unwrap();
         let key_path = dir.path().join("vault.key");
         fs::write(&key_path, b"too-short")?;
 
-        let crypto = VaultCrypto::load_or_create(&key_path)?;
-        assert_eq!(fs::metadata(&key_path)?.len(), 32);
-
-        let (ciphertext, nonce) = crypto.encrypt(b"ok")?;
-        let decrypted = crypto.decrypt(&ciphertext, &nonce)?;
-        assert_eq!(decrypted, b"ok");
+        let error = match VaultCrypto::load_or_create(&key_path) {
+            Ok(_) => panic!("invalid key must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, CliError::VaultError(_)));
+        assert_eq!(fs::read(&key_path)?, b"too-short");
         Ok(())
     }
 
@@ -131,7 +190,9 @@ mod tests {
         let (ciphertext, mut nonce) = crypto.encrypt(b"secret")?;
         nonce[0] ^= 0b0000_0001;
 
-        let err = crypto.decrypt(&ciphertext, &nonce).expect_err("decrypt should fail");
+        let err = crypto
+            .decrypt(&ciphertext, &nonce)
+            .expect_err("decrypt should fail");
         assert!(matches!(err, CliError::VaultError(_)));
         Ok(())
     }
@@ -145,7 +206,9 @@ mod tests {
         let (mut ciphertext, nonce) = crypto.encrypt(b"secret")?;
         ciphertext[0] ^= 0b0000_0001;
 
-        let err = crypto.decrypt(&ciphertext, &nonce).expect_err("decrypt should fail");
+        let err = crypto
+            .decrypt(&ciphertext, &nonce)
+            .expect_err("decrypt should fail");
         assert!(matches!(err, CliError::VaultError(_)));
         Ok(())
     }

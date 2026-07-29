@@ -1,5 +1,6 @@
 use assert_cmd::Command;
 use serde_json::Value;
+use std::fs;
 use tempfile::tempdir;
 
 fn run_success(config_root: &std::path::Path, args: &[&str]) -> String {
@@ -83,7 +84,10 @@ fn oauth_provider_add_is_reflected_in_json_list() {
     assert_eq!(items.len(), 1);
     let p = &items[0];
     assert_eq!(p.get("id").and_then(Value::as_str), Some("oauth1"));
-    assert_eq!(p.get("auth_type").and_then(Value::as_str), Some("oauth-pkce"));
+    assert_eq!(
+        p.get("auth_type").and_then(Value::as_str),
+        Some("oauth-pkce")
+    );
     assert_eq!(p.get("client_id").and_then(Value::as_str), Some("client-1"));
     assert_eq!(
         p.get("auth_url").and_then(Value::as_str),
@@ -110,4 +114,78 @@ fn api_call_with_invalid_json_body_returns_error() {
 
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr UTF-8");
     assert!(stderr.contains("Invalid JSON body") || stderr.contains("Internal error"));
+}
+
+#[test]
+fn action_validation_and_openapi_import_work_through_main() {
+    let dir = tempdir().expect("temp dir");
+    let action = dir.path().join("customer.get.yaml");
+    fs::write(
+        &action,
+        r#"
+api_version: apicli.dev/v1alpha1
+kind: Action
+metadata:
+  name: customer.get
+  description: Get a customer
+  enabled: true
+spec:
+  input_schema:
+    type: object
+    additionalProperties: false
+    properties:
+      customer_id: {type: string}
+    required: [customer_id]
+  executor:
+    provider: crm
+    operation_id: getCustomer
+    method: GET
+    path: /customers/{customer_id}
+    parameters:
+      customer_id: path
+  risk: read
+  approval: never
+"#,
+    )
+    .expect("write action");
+    let validated = run_success(
+        dir.path(),
+        &["action", "validate", action.to_str().expect("path")],
+    );
+    assert!(validated.contains("customer.get"));
+
+    let openapi = dir.path().join("openapi.yaml");
+    fs::write(
+        &openapi,
+        r#"
+openapi: 3.1.0
+info: {title: CRM, version: "1"}
+paths:
+  /customers/{customer_id}:
+    get:
+      operationId: getCustomer
+      parameters:
+        - {in: path, name: customer_id, required: true, schema: {type: string}}
+      responses:
+        "200": {description: ok}
+"#,
+    )
+    .expect("write OpenAPI");
+    let output = dir.path().join("imported");
+    let imported = run_success(
+        dir.path(),
+        &[
+            "openapi",
+            "import",
+            openapi.to_str().expect("path"),
+            "--provider",
+            "crm",
+            "--output-dir",
+            output.to_str().expect("path"),
+        ],
+    );
+    assert!(imported.contains("getcustomer.yaml"));
+    let draft = fs::read_to_string(output.join("getcustomer.yaml")).expect("read draft");
+    assert!(draft.contains("enabled: false"));
+    assert!(draft.contains("provider: crm"));
 }

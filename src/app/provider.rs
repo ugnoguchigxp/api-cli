@@ -1,18 +1,27 @@
-use crate::domain::provider::ProviderConfig;
-use crate::error::Result;
-use crate::infra::db::MetadataDb;
+use crate::domain::provider::{AuthType, CredentialPlacement, ProviderConfig};
+use crate::error::{CliError, Result};
+use crate::infra::db::{MetadataDb, VaultDb};
 
-pub struct ProviderApp<'a> {
-    db: &'a MetadataDb,
+#[derive(Clone)]
+pub struct ProviderApp {
+    db: MetadataDb,
+    vault_db: VaultDb,
 }
 
-impl<'a> ProviderApp<'a> {
-    pub fn new(db: &'a MetadataDb) -> Self {
-        Self { db }
+impl ProviderApp {
+    pub fn new(db: &MetadataDb, vault_db: &VaultDb) -> Self {
+        Self {
+            db: db.clone(),
+            vault_db: vault_db.clone(),
+        }
     }
 
     pub fn add_provider(&self, config: ProviderConfig) -> Result<()> {
-        self.db.insert_provider(&config)
+        validate_provider(&config)?;
+        if !self.db.create_provider(&config)? {
+            return Err(CliError::ProviderAlreadyExists(config.id));
+        }
+        Ok(())
     }
 
     pub fn list_providers(&self) -> Result<Vec<ProviderConfig>> {
@@ -25,15 +34,144 @@ impl<'a> ProviderApp<'a> {
     }
 
     pub fn remove_provider(&self, id: &str) -> Result<()> {
-        self.db.delete_provider(id)
+        for secret_id in self.db.delete_provider(id)? {
+            self.vault_db.delete_secret(&secret_id)?;
+        }
+        Ok(())
     }
+}
+
+fn validate_provider(config: &ProviderConfig) -> Result<()> {
+    if config.id.is_empty()
+        || config.id.len() > 128
+        || !config
+            .id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+    {
+        return Err(CliError::InvalidProvider(format!(
+            "invalid provider ID {}",
+            config.id
+        )));
+    }
+    let base_url =
+        validate_configured_url(&config.base_url, "provider", config.allow_private_network)?;
+    if base_url.query().is_some() || base_url.fragment().is_some() {
+        return Err(CliError::BlockedUrl(
+            "provider base URL cannot contain a query or fragment".into(),
+        ));
+    }
+    if let CredentialPlacement::Header { name } = &config.credential_placement {
+        let header = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|error| CliError::Internal(format!("invalid API key header: {error}")))?;
+        if crate::app::action::is_forbidden_request_header(&header) {
+            return Err(CliError::Internal(format!(
+                "sensitive API key header is forbidden: {name}"
+            )));
+        }
+    }
+    if config.auth_type == AuthType::OauthPkce
+        && (config.client_id.as_deref().unwrap_or_default().is_empty()
+            || config.auth_url.as_deref().unwrap_or_default().is_empty()
+            || config.token_url.as_deref().unwrap_or_default().is_empty())
+    {
+        return Err(CliError::Internal(
+            "OAuth PKCE provider requires client-id, auth-url, and token-url".into(),
+        ));
+    }
+    match config.auth_type {
+        AuthType::OauthPkce => {
+            if !matches!(config.credential_placement, CredentialPlacement::Bearer) {
+                return Err(CliError::InvalidProvider(
+                    "OAuth PKCE credentials must use Bearer placement".into(),
+                ));
+            }
+            validate_configured_url(
+                config.auth_url.as_deref().unwrap_or_default(),
+                "OAuth authorization",
+                config.allow_private_network,
+            )?;
+            validate_configured_url(
+                config.token_url.as_deref().unwrap_or_default(),
+                "OAuth token",
+                config.allow_private_network,
+            )?;
+            if config.oauth_redirect_port == Some(0) {
+                return Err(CliError::InvalidProvider(
+                    "oauth_redirect_port must be non-zero when specified".into(),
+                ));
+            }
+        }
+        AuthType::ApiKey => {
+            if config.client_id.is_some()
+                || config.auth_url.is_some()
+                || config.token_url.is_some()
+                || config.oauth_redirect_port.is_some()
+            {
+                return Err(CliError::InvalidProvider(
+                    "API Key provider cannot contain OAuth settings".into(),
+                ));
+            }
+        }
+    }
+    let mut scopes = std::collections::BTreeSet::new();
+    if config.scopes.len() > 256 {
+        return Err(CliError::InvalidProvider(
+            "provider cannot declare more than 256 scopes".into(),
+        ));
+    }
+    for scope in &config.scopes {
+        if scope.is_empty()
+            || scope.trim() != scope
+            || scope.len() > 256
+            || scope.chars().any(char::is_whitespace)
+            || !scopes.insert(scope)
+        {
+            return Err(CliError::InvalidProvider(
+                "scopes must be non-empty, unique, and contain no whitespace".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_configured_url(
+    value: &str,
+    label: &str,
+    allow_private_network: bool,
+) -> Result<url::Url> {
+    let parsed = url::Url::parse(value)
+        .map_err(|error| CliError::BlockedUrl(format!("invalid {label} URL: {error}")))?;
+    if parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(CliError::BlockedUrl(format!(
+            "{label} URL requires a host and cannot contain credentials or a fragment"
+        )));
+    }
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|address| address.is_loopback())
+    });
+    if parsed.scheme() != "https"
+        && !(parsed.scheme() == "http" && loopback && allow_private_network)
+    {
+        return Err(CliError::BlockedUrl(format!(
+            "{label} URL must use HTTPS; loopback HTTP requires --allow-private-network"
+        )));
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::provider::AuthType;
-    use crate::infra::db::MetadataDb;
+    use crate::domain::provider::{AuthType, CredentialPlacement};
+    use crate::infra::db::{MetadataDb, VaultDb};
     use rusqlite::Connection;
 
     fn sample_provider(id: &str) -> ProviderConfig {
@@ -45,6 +183,9 @@ mod tests {
             client_id: None,
             auth_url: None,
             token_url: None,
+            credential_placement: CredentialPlacement::Bearer,
+            oauth_redirect_port: None,
+            allow_private_network: false,
         }
     }
 
@@ -52,7 +193,9 @@ mod tests {
     fn add_get_list_remove_provider() {
         let conn = Connection::open_in_memory().expect("in-memory metadata db");
         let db = MetadataDb::new(conn).expect("metadata db init");
-        let app = ProviderApp::new(&db);
+        let vault =
+            VaultDb::new(Connection::open_in_memory().expect("in-memory vault db")).expect("vault");
+        let app = ProviderApp::new(&db, &vault);
         let config = sample_provider("p1");
 
         app.add_provider(config).expect("insert provider");
@@ -68,6 +211,60 @@ mod tests {
         assert!(app
             .get_provider("p1")
             .expect("get provider after remove")
+            .is_none());
+    }
+
+    #[test]
+    fn duplicate_provider_cannot_redirect_an_existing_credential() {
+        let db = MetadataDb::new(Connection::open_in_memory().expect("metadata")).expect("db");
+        let vault = VaultDb::new(Connection::open_in_memory().expect("vault")).expect("vault");
+        let app = ProviderApp::new(&db, &vault);
+        app.add_provider(sample_provider("p1")).expect("first add");
+
+        let mut redirected = sample_provider("p1");
+        redirected.base_url = "https://attacker.example".into();
+        let error = app
+            .add_provider(redirected)
+            .expect_err("duplicate provider must fail");
+        assert!(matches!(error, CliError::ProviderAlreadyExists(id) if id == "p1"));
+        assert_eq!(
+            app.get_provider("p1")
+                .expect("provider")
+                .expect("existing provider")
+                .base_url,
+            "https://example.com"
+        );
+    }
+
+    #[test]
+    fn removing_provider_deletes_credential_sessions_and_vault_records() {
+        use crate::app::auth::AuthApp;
+        use crate::infra::crypto::VaultCrypto;
+        use tempfile::tempdir;
+
+        let db = MetadataDb::new(Connection::open_in_memory().expect("metadata")).expect("db");
+        let vault = VaultDb::new(Connection::open_in_memory().expect("vault")).expect("vault");
+        let directory = tempdir().expect("tempdir");
+        let crypto = VaultCrypto::load_or_create(&directory.path().join("key")).expect("vault key");
+        let app = ProviderApp::new(&db, &vault);
+        app.add_provider(sample_provider("p1")).expect("provider");
+        AuthApp::new(&db, &vault, &crypto)
+            .login_api_key("p1", Some("secret"))
+            .expect("login");
+        let secret_id = db
+            .get_latest_session("p1")
+            .expect("session lookup")
+            .expect("session")
+            .secret_id;
+
+        app.remove_provider("p1").expect("remove");
+        assert!(db
+            .get_latest_session("p1")
+            .expect("session lookup")
+            .is_none());
+        assert!(vault
+            .get_secret(&secret_id)
+            .expect("vault lookup")
             .is_none());
     }
 }

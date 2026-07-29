@@ -7,9 +7,7 @@ pub fn get_api_cli_dir() -> Result<PathBuf> {
     let proj_dirs = ProjectDirs::from("com", "api-cli", "api-cli")
         .ok_or_else(|| CliError::Internal("Could not determine project directories".to_string()))?;
     let dir = proj_dirs.config_dir().to_path_buf();
-    if !dir.exists() {
-        fs::create_dir_all(&dir)?;
-    }
+    ensure_private_dir(&dir)?;
     Ok(dir)
 }
 
@@ -25,13 +23,36 @@ pub fn get_vault_key_path() -> Result<PathBuf> {
     Ok(get_api_cli_dir()?.join("vault.key"))
 }
 
+pub fn get_actions_dir() -> Result<PathBuf> {
+    let dir = get_api_cli_dir()?.join("actions.d");
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
 #[allow(dead_code)]
 pub fn get_runtime_sock_path() -> Result<PathBuf> {
     let runtime_dir = get_api_cli_dir()?.join("runtime");
-    if !runtime_dir.exists() {
-        fs::create_dir_all(&runtime_dir)?;
-    }
+    ensure_private_dir(&runtime_dir)?;
     Ok(runtime_dir.join("mcp.sock"))
+}
+
+fn ensure_private_dir(path: &std::path::Path) -> Result<()> {
+    fs::create_dir_all(path)?;
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(CliError::Internal(format!(
+            "{} must be a regular directory, not a symlink",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -85,6 +106,14 @@ mod tests {
         let dir = get_api_cli_dir().expect("get api-cli dir");
         assert!(dir.exists());
         assert!(dir.starts_with(temp_home.path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
     }
 
     #[test]

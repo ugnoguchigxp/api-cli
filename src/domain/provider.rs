@@ -7,7 +7,17 @@ pub enum AuthType {
     ApiKey,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum CredentialPlacement {
+    #[default]
+    Bearer,
+    Header {
+        name: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub id: String,
     pub base_url: String,
@@ -19,11 +29,18 @@ pub struct ProviderConfig {
     pub auth_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_url: Option<String>,
+    #[serde(default)]
+    pub credential_placement: CredentialPlacement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth_redirect_port: Option<u16>,
+    /// Explicitly allow loopback, private, link-local, or unique-local egress.
+    #[serde(default)]
+    pub allow_private_network: bool,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{AuthType, ProviderConfig};
+    use super::{AuthType, CredentialPlacement, ProviderConfig};
 
     #[test]
     fn auth_type_uses_kebab_case_serde_format() {
@@ -46,6 +63,9 @@ mod tests {
             client_id: None,
             auth_url: None,
             token_url: None,
+            credential_placement: CredentialPlacement::Bearer,
+            oauth_redirect_port: None,
+            allow_private_network: false,
         };
 
         let value = serde_json::to_value(provider).expect("serialize provider");

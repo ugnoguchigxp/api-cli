@@ -13,35 +13,69 @@ use reqwest::Client;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::time::Duration;
 
-pub struct AuthApp<'a> {
-    metadata_db: &'a MetadataDb,
-    vault_db: &'a VaultDb,
-    crypto: &'a VaultCrypto,
-    client: Client,
-    refresh_lock: tokio::sync::Mutex<()>,
+const OAUTH_CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
+
+#[derive(Clone)]
+pub struct AuthApp {
+    metadata_db: MetadataDb,
+    vault_db: VaultDb,
+    crypto: VaultCrypto,
+    public_client: Client,
+    private_client: Client,
+    refresh_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
     expires_in: Option<u64>,
+    scope: Option<String>,
+    token_type: Option<String>,
 }
 
-impl<'a> AuthApp<'a> {
-    pub fn new(
-        metadata_db: &'a MetadataDb,
-        vault_db: &'a VaultDb,
-        crypto: &'a VaultCrypto,
-    ) -> Self {
-        Self {
-            metadata_db,
-            vault_db,
-            crypto,
-            client: Client::new(),
-            refresh_lock: tokio::sync::Mutex::new(()),
-        }
+#[derive(Debug)]
+struct OAuthCallback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+    error_description: Option<String>,
+}
+
+impl AuthApp {
+    #[cfg(test)]
+    pub fn new(metadata_db: &MetadataDb, vault_db: &VaultDb, crypto: &VaultCrypto) -> Self {
+        Self::try_new(metadata_db, vault_db, crypto)
+            .expect("static OAuth HTTP client configuration must be valid")
+    }
+
+    pub fn try_new(
+        metadata_db: &MetadataDb,
+        vault_db: &VaultDb,
+        crypto: &VaultCrypto,
+    ) -> Result<Self> {
+        let build_client = |allow_private_network| {
+            crate::app::api::configure_dns(Client::builder(), allow_private_network)
+                .connect_timeout(crate::app::api::DEFAULT_CONNECT_TIMEOUT)
+                .timeout(crate::app::api::DEFAULT_REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .map_err(|error| {
+                    CliError::Internal(format!("Failed to create OAuth HTTP client: {error}"))
+                })
+        };
+        let public_client = build_client(false)?;
+        let private_client = build_client(true)?;
+        Ok(Self {
+            metadata_db: metadata_db.clone(),
+            vault_db: vault_db.clone(),
+            crypto: crypto.clone(),
+            public_client,
+            private_client,
+            refresh_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        })
     }
 
     pub fn login_api_key(&self, provider_id: &str, api_key: Option<&str>) -> Result<()> {
@@ -64,6 +98,9 @@ impl<'a> AuthApp<'a> {
                     .map_err(|e| CliError::Internal(format!("Failed to read password: {}", e)))?
             }
         };
+        if key.is_empty() {
+            return Err(CliError::AuthRequired);
+        }
 
         let secret_id = format!("apikey_{}_{}", provider_id, Uuid::new_v4());
         let (cipher_text, nonce) = self.crypto.encrypt(key.as_bytes())?;
@@ -74,6 +111,8 @@ impl<'a> AuthApp<'a> {
         let session = SessionRecord {
             session_id: format!("sess_{}", Uuid::new_v4()),
             provider_id: provider_id.to_string(),
+            principal_id: "local-user".into(),
+            tenant_id: "local".into(),
             scopes: provider.scopes.clone(),
             expires_at: None,
             secret_id,
@@ -84,6 +123,20 @@ impl<'a> AuthApp<'a> {
     }
 
     pub async fn login_oauth_pkce(&self, provider_id: &str) -> Result<()> {
+        self.login_oauth_pkce_with_authorizer(provider_id, |authorize_url| {
+            println!("Open this URL in your browser:\n{}\n", authorize_url);
+        })
+        .await
+    }
+
+    async fn login_oauth_pkce_with_authorizer<F>(
+        &self,
+        provider_id: &str,
+        authorize: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(url::Url),
+    {
         let provider = self
             .metadata_db
             .get_provider(provider_id)?
@@ -107,29 +160,48 @@ impl<'a> AuthApp<'a> {
             .token_url
             .as_ref()
             .ok_or_else(|| CliError::Internal("Missing token_url".into()))?;
+        let parsed_auth_url = url::Url::parse(auth_url)
+            .map_err(|error| CliError::BlockedUrl(format!("invalid authorization URL: {error}")))?;
+        crate::app::api::validate_outbound_url(&parsed_auth_url, provider.allow_private_network)
+            .await?;
+        let parsed_token_url = url::Url::parse(token_url)
+            .map_err(|error| CliError::BlockedUrl(format!("invalid token URL: {error}")))?;
+        crate::app::api::validate_outbound_url(&parsed_token_url, provider.allow_private_network)
+            .await?;
+
+        // Bind first so the exact same redirect URI is used for both authorization
+        // and token exchange.
+        let listener =
+            tokio::net::TcpListener::bind(("127.0.0.1", provider.oauth_redirect_port.unwrap_or(0)))
+                .await
+                .map_err(|e| {
+                    CliError::Internal(format!("Failed to bind OAuth callback listener: {e}"))
+                })?;
+        let callback_addr = listener
+            .local_addr()
+            .map_err(|e| CliError::Internal(format!("Failed to read callback address: {e}")))?;
+        let redirect_uri = format!("http://{callback_addr}/callback");
 
         // 1. Generate PKCE & state
         let (code_verifier, code_challenge, expected_state) = self.generate_pkce_params();
 
         // 2. Build Authorize URL
-        let redirect_uri = "http://127.0.0.1:8080/callback"; // Default for pre-registration
         let authorize_url = self.build_authorize_url(
             auth_url,
             client_id,
-            redirect_uri,
+            &redirect_uri,
             &provider.scopes,
             &expected_state,
             &code_challenge,
         )?;
 
-        println!("Open this URL in your browser:\n{}\n", authorize_url);
+        authorize(authorize_url);
 
         // 3. Start callback server and wait for code
-        let (code_str, state_str) = self.start_callback_server().await?;
-
-        if state_str != expected_state {
-            return Err(CliError::Internal("CSRF token mismatch".into()));
-        }
+        let callback = self
+            .start_callback_server(listener, &expected_state)
+            .await?;
+        let code_str = validate_oauth_callback(callback, &expected_state)?;
 
         // 4. Exchange code for token
         let token_result = self
@@ -137,8 +209,9 @@ impl<'a> AuthApp<'a> {
                 token_url,
                 client_id,
                 &code_str,
-                redirect_uri,
+                &redirect_uri,
                 &code_verifier,
+                provider.allow_private_network,
             )
             .await?;
 
@@ -174,6 +247,22 @@ impl<'a> AuthApp<'a> {
         challenge: &str,
     ) -> Result<url::Url> {
         let mut url = url::Url::parse(auth_url).map_err(|e| CliError::Internal(e.to_string()))?;
+        const RESERVED: [&str; 7] = [
+            "response_type",
+            "client_id",
+            "redirect_uri",
+            "scope",
+            "state",
+            "code_challenge",
+            "code_challenge_method",
+        ];
+        let existing = url
+            .query_pairs()
+            .filter(|(key, _)| !RESERVED.contains(&key.as_ref()))
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<Vec<_>>();
+        url.set_query(None);
+        url.query_pairs_mut().extend_pairs(existing);
         let scopes_str = scopes.join(" ");
         url.query_pairs_mut()
             .append_pair("response_type", "code")
@@ -186,43 +275,79 @@ impl<'a> AuthApp<'a> {
         Ok(url)
     }
 
-    async fn start_callback_server(&self) -> Result<(String, String)> {
-        type CallbackTx = std::sync::Arc<
-            tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<(String, String)>>>,
-        >;
+    async fn start_callback_server(
+        &self,
+        listener: tokio::net::TcpListener,
+        expected_state: &str,
+    ) -> Result<OAuthCallback> {
+        type CallbackTx =
+            std::sync::Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<OAuthCallback>>>>;
+        #[derive(Clone)]
+        struct CallbackState {
+            tx: CallbackTx,
+            expected_state: String,
+        }
 
-        let (tx, rx) = tokio::sync::oneshot::channel::<(String, String)>();
+        let (tx, rx) = tokio::sync::oneshot::channel::<OAuthCallback>();
         let tx: CallbackTx = std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx)));
 
         use axum::{extract::Query, extract::State, response::Html, routing::get, Router};
-        let app = Router::new().route("/callback", get(move |Query(params): Query<HashMap<String, String>>, State(tx): State<CallbackTx>| {
-            async move {
-                let code = params.get("code").cloned().unwrap_or_default();
-                let state = params.get("state").cloned().unwrap_or_default();
-                if let Some(chan) = tx.lock().await.take() {
-                    let _ = chan.send((code, state));
-                }
-                Html("<html><body>Authentication successful! You can close this window.</body></html>")
-            }
-        })).with_state(tx);
+        let app = Router::new()
+            .route(
+                "/callback",
+                get(
+                    move |Query(params): Query<HashMap<String, String>>,
+                          State(state): State<CallbackState>| async move {
+                        let callback = OAuthCallback {
+                            code: params.get("code").cloned(),
+                            state: params.get("state").cloned(),
+                            error: params.get("error").cloned(),
+                            error_description: params.get("error_description").cloned(),
+                        };
+                        let valid_state =
+                            callback.state.as_deref() == Some(state.expected_state.as_str());
+                        let succeeded = callback.error.is_none() && callback.code.is_some();
+                        if valid_state {
+                            if let Some(chan) = state.tx.lock().await.take() {
+                                let _ = chan.send(callback);
+                            }
+                        }
+                        if valid_state && succeeded {
+                            Html(
+                                "<html><body>Authentication successful. You can close this window.</body></html>",
+                            )
+                        } else {
+                            Html(
+                                "<html><body>Authentication failed. Return to the terminal for details.</body></html>",
+                            )
+                        }
+                    },
+                ),
+            )
+            .with_state(CallbackState {
+                tx,
+                expected_state: expected_state.into(),
+            });
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| CliError::Internal(format!("Failed to bind to local port: {}", e)))?;
         let addr = listener
             .local_addr()
             .map_err(|e| CliError::Internal(e.to_string()))?;
-        let dynamic_redirect_uri = format!("http://{}/callback", addr);
-
-        println!("Waiting for callback on {} ...", dynamic_redirect_uri);
-        println!("Note: If your provider requires a fixed redirect URI, ensure http://127.0.0.1:8080/callback is registered.");
+        println!("Waiting for callback on http://{addr}/callback ...");
 
         tokio::select! {
             result = rx => {
-                result.map_err(|_| CliError::Internal("Failed to receive callback".into()))
+                result.map_err(|_| CliError::Internal("Failed to receive OAuth callback".into()))
             }
-            _ = axum::serve(listener, app) => {
-                Err(CliError::Internal("Server exited unexpectedly".into()))
+            result = axum::serve(listener, app) => {
+                match result {
+                    Ok(()) => Err(CliError::Internal("OAuth callback server exited unexpectedly".into())),
+                    Err(error) => Err(CliError::Internal(format!("OAuth callback server failed: {error}"))),
+                }
+            }
+            _ = tokio::time::sleep(OAUTH_CALLBACK_TIMEOUT) => {
+                Err(CliError::RequestTimeout {
+                    timeout_ms: OAUTH_CALLBACK_TIMEOUT.as_millis() as u64,
+                })
             }
         }
     }
@@ -234,6 +359,7 @@ impl<'a> AuthApp<'a> {
         code: &str,
         redirect_uri: &str,
         verifier: &str,
+        allow_private_network: bool,
     ) -> Result<TokenResponse> {
         let mut params = HashMap::new();
         params.insert("grant_type", "authorization_code");
@@ -242,25 +368,15 @@ impl<'a> AuthApp<'a> {
         params.insert("client_id", client_id);
         params.insert("code_verifier", verifier);
 
-        let res = self
-            .client
+        let response = self
+            .client(allow_private_network)
             .post(token_url)
             .form(&params)
             .send()
             .await
             .map_err(|e| CliError::Internal(format!("Token exchange request failed: {}", e)))?;
 
-        if !res.status().is_success() {
-            let err_text = res.text().await.unwrap_or_default();
-            return Err(CliError::Internal(format!(
-                "Token exchange failed: {}",
-                err_text
-            )));
-        }
-
-        res.json()
-            .await
-            .map_err(|e| CliError::Internal(format!("Failed to parse token response: {}", e)))
+        parse_token_response(response, "Token exchange").await
     }
 
     fn store_oauth_session(
@@ -269,6 +385,11 @@ impl<'a> AuthApp<'a> {
         token_result: &TokenResponse,
         scopes: &[String],
     ) -> Result<()> {
+        if token_result.access_token.is_empty() {
+            return Err(CliError::Internal(
+                "Token response contains an empty access_token".into(),
+            ));
+        }
         let payload = serde_json::json!({
             "access_token": token_result.access_token,
             "refresh_token": token_result.refresh_token
@@ -281,21 +402,18 @@ impl<'a> AuthApp<'a> {
         self.vault_db
             .insert_secret(&secret_id, "oauth_token", &cipher_text, &nonce)?;
 
-        let expires_in_sec = token_result.expires_in.unwrap_or(0);
-        let expires_at = if expires_in_sec > 0 {
-            Some(
-                Utc::now()
-                    + chrono::Duration::try_seconds(expires_in_sec as i64)
-                        .unwrap_or(chrono::Duration::zero()),
-            )
-        } else {
-            None
+        let expires_at = token_expiry(token_result.expires_in)?;
+        let granted_scopes = match token_result.scope.as_deref() {
+            Some(scope) => parse_scope(scope)?,
+            None => scopes.to_vec(),
         };
 
         let session = SessionRecord {
             session_id: format!("sess_{}", Uuid::new_v4()),
             provider_id: provider_id.to_string(),
-            scopes: scopes.to_vec(),
+            principal_id: "local-user".into(),
+            tenant_id: "local".into(),
+            scopes: granted_scopes,
             expires_at,
             secret_id,
         };
@@ -304,7 +422,18 @@ impl<'a> AuthApp<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub async fn refresh_oauth_token(&self, provider_id: &str) -> Result<()> {
+        self.refresh_oauth_token_for(provider_id, "local-user", "local")
+            .await
+    }
+
+    pub async fn refresh_oauth_token_for(
+        &self,
+        provider_id: &str,
+        principal_id: &str,
+        tenant_id: &str,
+    ) -> Result<()> {
         let _guard = self.refresh_lock.lock().await;
 
         let provider = self
@@ -320,7 +449,7 @@ impl<'a> AuthApp<'a> {
 
         let session = self
             .metadata_db
-            .get_latest_session(provider_id)?
+            .get_latest_session_for(provider_id, principal_id, tenant_id)?
             .ok_or_else(|| CliError::AuthRequired)?;
 
         // DBに記録されている最新のExpiresを見て、すでに他の呼び出しによって更新済みであればスキップ
@@ -356,37 +485,31 @@ impl<'a> AuthApp<'a> {
             .token_url
             .as_ref()
             .ok_or_else(|| CliError::Internal("Missing token_url".into()))?;
+        let parsed_token_url = url::Url::parse(token_url)
+            .map_err(|error| CliError::BlockedUrl(format!("invalid token URL: {error}")))?;
+        crate::app::api::validate_outbound_url(&parsed_token_url, provider.allow_private_network)
+            .await?;
 
         let mut params = HashMap::new();
         params.insert("grant_type", "refresh_token");
         params.insert("refresh_token", refresh_token_str);
         params.insert("client_id", client_id);
 
-        let res = self
-            .client
+        let response = self
+            .client(provider.allow_private_network)
             .post(token_url)
             .form(&params)
             .send()
             .await
             .map_err(|e| CliError::Internal(format!("Token refresh request failed: {}", e)))?;
 
-        if !res.status().is_success() {
-            let err_text = res.text().await.unwrap_or_default();
-            return Err(CliError::Internal(format!(
-                "Token refresh failed: {}",
-                err_text
-            )));
-        }
-
-        let token_result: TokenResponse = res
-            .json()
-            .await
-            .map_err(|e| CliError::Internal(format!("Failed to parse token response: {}", e)))?;
-
+        let token_result = parse_token_response(response, "Token refresh").await?;
         let access_token = token_result.access_token;
         // Fallback to old refresh token if new one is not returned
         let base_refresh = refresh_token_str.to_string();
         let final_refresh_token = token_result.refresh_token.unwrap_or(base_refresh);
+        let expires_at = token_expiry(token_result.expires_in)?;
+        let granted_scopes = token_result.scope.as_deref().map(parse_scope).transpose()?;
 
         let payload = serde_json::json!({
             "access_token": access_token,
@@ -399,29 +522,125 @@ impl<'a> AuthApp<'a> {
         self.vault_db
             .insert_secret(&session.secret_id, "oauth_token", &new_cipher, &new_nonce)?;
 
-        let expires_in_sec = token_result.expires_in.unwrap_or(0);
-        let expires_at = if expires_in_sec > 0 {
-            Some(
-                Utc::now()
-                    + chrono::Duration::try_seconds(expires_in_sec as i64)
-                        .unwrap_or(chrono::Duration::zero()),
-            )
-        } else {
-            None
-        };
-
         let mut updated_session = session;
         updated_session.expires_at = expires_at;
+        if let Some(scopes) = granted_scopes {
+            updated_session.scopes = scopes;
+        }
         self.metadata_db.insert_session(&updated_session)?;
 
         Ok(())
     }
+
+    fn client(&self, allow_private_network: bool) -> &Client {
+        if allow_private_network {
+            &self.private_client
+        } else {
+            &self.public_client
+        }
+    }
+}
+
+async fn parse_token_response(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<TokenResponse> {
+    let status = response.status();
+    let bytes =
+        crate::app::api::read_limited_response(response, crate::app::api::DEFAULT_MAX_ERROR_BYTES)
+            .await?;
+    if !status.is_success() {
+        return Err(CliError::Internal(format!(
+            "{operation} failed with HTTP {}",
+            status.as_u16()
+        )));
+    }
+    let token: TokenResponse = serde_json::from_slice(&bytes)
+        .map_err(|error| CliError::Internal(format!("Failed to parse token response: {error}")))?;
+    if token.access_token.is_empty() {
+        return Err(CliError::Internal(
+            "Token response contains an empty access_token".into(),
+        ));
+    }
+    if token
+        .token_type
+        .as_deref()
+        .is_some_and(|token_type| !token_type.eq_ignore_ascii_case("bearer"))
+    {
+        return Err(CliError::Internal(
+            "Token response uses an unsupported token_type".into(),
+        ));
+    }
+    Ok(token)
+}
+
+fn token_expiry(expires_in: Option<u64>) -> Result<Option<chrono::DateTime<Utc>>> {
+    let Some(expires_in) = expires_in else {
+        return Ok(None);
+    };
+    let seconds = i64::try_from(expires_in)
+        .map_err(|_| CliError::Internal("expires_in exceeds the supported range".into()))?;
+    let duration = chrono::Duration::try_seconds(seconds)
+        .ok_or_else(|| CliError::Internal("expires_in exceeds the supported range".into()))?;
+    Utc::now()
+        .checked_add_signed(duration)
+        .map(Some)
+        .ok_or_else(|| CliError::Internal("token expiry exceeds the supported range".into()))
+}
+
+fn parse_scope(scope: &str) -> Result<Vec<String>> {
+    let mut scopes = scope
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if scopes.len() > 256
+        || scopes
+            .iter()
+            .any(|scope| scope.len() > 256 || scope.chars().any(char::is_whitespace))
+    {
+        return Err(CliError::Internal(
+            "OAuth token scope set is malformed or exceeds supported limits".into(),
+        ));
+    }
+    scopes.sort();
+    scopes.dedup();
+    Ok(scopes)
+}
+
+fn validate_oauth_callback(callback: OAuthCallback, expected_state: &str) -> Result<String> {
+    if let Some(error) = callback.error {
+        let error = sanitize_oauth_error(&error);
+        let description = sanitize_oauth_error(callback.error_description.as_deref().unwrap_or(""));
+        return Err(CliError::Internal(format!(
+            "OAuth authorization failed: {error} {description}"
+        )));
+    }
+    let code = callback
+        .code
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Internal("OAuth callback did not include a code".into()))?;
+    let state = callback
+        .state
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| CliError::Internal("OAuth callback did not include state".into()))?;
+    if state != expected_state {
+        return Err(CliError::Internal("CSRF token mismatch".into()));
+    }
+    Ok(code)
+}
+
+fn sanitize_oauth_error(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(512)
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::provider::{AuthType, ProviderConfig};
+    use crate::domain::provider::{AuthType, CredentialPlacement, ProviderConfig};
     use crate::infra::db::{MetadataDb, VaultDb};
     use chrono::Duration;
     use rusqlite::Connection;
@@ -430,11 +649,11 @@ mod tests {
     fn setup() -> (MetadataDb, VaultDb, VaultCrypto) {
         let metadata = MetadataDb::new(Connection::open_in_memory().expect("metadata conn"))
             .expect("metadata db init");
-        let vault = VaultDb::new(Connection::open_in_memory().expect("vault conn"))
-            .expect("vault db init");
+        let vault =
+            VaultDb::new(Connection::open_in_memory().expect("vault conn")).expect("vault db init");
         let dir = tempdir().expect("temp dir");
-        let crypto = VaultCrypto::load_or_create(&dir.path().join("vault.key"))
-            .expect("crypto init");
+        let crypto =
+            VaultCrypto::load_or_create(&dir.path().join("vault.key")).expect("crypto init");
         (metadata, vault, crypto)
     }
 
@@ -447,6 +666,9 @@ mod tests {
             client_id: None,
             auth_url: None,
             token_url: None,
+            credential_placement: CredentialPlacement::Bearer,
+            oauth_redirect_port: None,
+            allow_private_network: false,
         }
     }
 
@@ -459,6 +681,9 @@ mod tests {
             client_id: Some("client-1".to_string()),
             auth_url: Some("https://id.example.com/oauth/authorize".to_string()),
             token_url: Some("https://id.example.com/oauth/token".to_string()),
+            credential_placement: CredentialPlacement::Bearer,
+            oauth_redirect_port: None,
+            allow_private_network: false,
         }
     }
 
@@ -467,7 +692,9 @@ mod tests {
         let (metadata, vault, crypto) = setup();
         let app = AuthApp::new(&metadata, &vault, &crypto);
 
-        let err = app.login_api_key("missing", Some("abc")).expect_err("provider should be missing");
+        let err = app
+            .login_api_key("missing", Some("abc"))
+            .expect_err("provider should be missing");
         match err {
             CliError::ProviderNotFound(id) => assert_eq!(id, "missing"),
             other => panic!("unexpected error: {other:?}"),
@@ -477,17 +704,23 @@ mod tests {
     #[test]
     fn login_api_key_rejects_oauth_provider() {
         let (metadata, vault, crypto) = setup();
-        metadata.insert_provider(&oauth_provider("oauth")).expect("insert provider");
+        metadata
+            .insert_provider(&oauth_provider("oauth"))
+            .expect("insert provider");
         let app = AuthApp::new(&metadata, &vault, &crypto);
 
-        let err = app.login_api_key("oauth", Some("abc")).expect_err("auth type should mismatch");
+        let err = app
+            .login_api_key("oauth", Some("abc"))
+            .expect_err("auth type should mismatch");
         assert!(matches!(err, CliError::Internal(_)));
     }
 
     #[test]
     fn login_api_key_persists_encrypted_secret_and_session() {
         let (metadata, vault, crypto) = setup();
-        metadata.insert_provider(&api_key_provider("p1")).expect("insert provider");
+        metadata
+            .insert_provider(&api_key_provider("p1"))
+            .expect("insert provider");
         let app = AuthApp::new(&metadata, &vault, &crypto);
 
         app.login_api_key("p1", Some("secret-123")).expect("login");
@@ -497,7 +730,10 @@ mod tests {
             .expect("read latest session")
             .expect("session exists");
         assert_eq!(session.provider_id, "p1");
-        assert_eq!(session.scopes, vec!["read".to_string(), "write".to_string()]);
+        assert_eq!(
+            session.scopes,
+            vec!["read".to_string(), "write".to_string()]
+        );
         assert!(session.secret_id.starts_with("apikey_p1_"));
 
         let (cipher, nonce) = vault
@@ -540,17 +776,30 @@ mod tests {
             )
             .expect("url build");
 
-        let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+        let query: std::collections::HashMap<String, String> =
+            url.query_pairs().into_owned().collect();
         assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
-        assert_eq!(query.get("client_id").map(String::as_str), Some("client123"));
+        assert_eq!(
+            query.get("client_id").map(String::as_str),
+            Some("client123")
+        );
         assert_eq!(
             query.get("redirect_uri").map(String::as_str),
             Some("http://127.0.0.1:8080/callback")
         );
-        assert_eq!(query.get("scope").map(String::as_str), Some("scope-a scope-b"));
+        assert_eq!(
+            query.get("scope").map(String::as_str),
+            Some("scope-a scope-b")
+        );
         assert_eq!(query.get("state").map(String::as_str), Some("state123"));
-        assert_eq!(query.get("code_challenge").map(String::as_str), Some("challenge123"));
-        assert_eq!(query.get("code_challenge_method").map(String::as_str), Some("S256"));
+        assert_eq!(
+            query.get("code_challenge").map(String::as_str),
+            Some("challenge123")
+        );
+        assert_eq!(
+            query.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
     }
 
     #[test]
@@ -565,6 +814,201 @@ mod tests {
     }
 
     #[test]
+    fn oauth_callback_rejects_errors_missing_values_and_state_mismatch() {
+        assert!(validate_oauth_callback(
+            OAuthCallback {
+                code: Some("code".into()),
+                state: Some("state".into()),
+                error: Some("access_denied".into()),
+                error_description: Some("denied".into()),
+            },
+            "state",
+        )
+        .is_err());
+        assert!(validate_oauth_callback(
+            OAuthCallback {
+                code: None,
+                state: Some("state".into()),
+                error: None,
+                error_description: None,
+            },
+            "state",
+        )
+        .is_err());
+        assert!(validate_oauth_callback(
+            OAuthCallback {
+                code: Some("code".into()),
+                state: None,
+                error: None,
+                error_description: None,
+            },
+            "state",
+        )
+        .is_err());
+        assert!(validate_oauth_callback(
+            OAuthCallback {
+                code: Some("code".into()),
+                state: Some("other".into()),
+                error: None,
+                error_description: None,
+            },
+            "state",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn oauth_limits_scopes_and_treats_zero_expiry_as_expired() {
+        let before = Utc::now();
+        let expiry = token_expiry(Some(0))
+            .expect("zero expiry")
+            .expect("explicit zero has an expiry");
+        assert!(expiry >= before && expiry <= Utc::now());
+        assert!(token_expiry(None).expect("missing expiry").is_none());
+
+        assert_eq!(
+            parse_scope("write read read").expect("valid scopes"),
+            vec!["read".to_string(), "write".to_string()]
+        );
+        let excessive = (0..257)
+            .map(|index| format!("scope:{index}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(parse_scope(&excessive).is_err());
+        assert!(parse_scope(&format!("scope:{}", "x".repeat(257))).is_err());
+    }
+
+    #[test]
+    fn oauth_error_text_is_safe_for_terminal_output() {
+        let error = validate_oauth_callback(
+            OAuthCallback {
+                code: None,
+                state: Some("state".into()),
+                error: Some("denied\u{1b}[31m".into()),
+                error_description: Some("line\nbreak".into()),
+            },
+            "state",
+        )
+        .expect_err("OAuth error must fail")
+        .to_string();
+        assert!(!error.contains('\u{1b}'));
+        assert!(!error.contains('\n'));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_pkce_uses_identical_dynamic_redirect_uri_for_authorize_and_token() {
+        use axum::{
+            extract::{Form, Query, State},
+            response::Redirect,
+            routing::{get, post},
+            Json, Router,
+        };
+        use std::sync::Arc;
+
+        #[derive(Clone, Default)]
+        struct Captured {
+            authorize_redirect: Arc<tokio::sync::Mutex<Option<String>>>,
+            token_redirect: Arc<tokio::sync::Mutex<Option<String>>>,
+            verifier: Arc<tokio::sync::Mutex<Option<String>>>,
+        }
+
+        let captured = Captured::default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock oauth");
+        let address = listener.local_addr().expect("mock oauth address");
+        let router = Router::new()
+            .route(
+                "/authorize",
+                get(
+                    |Query(params): Query<HashMap<String, String>>,
+                     State(captured): State<Captured>| async move {
+                        let redirect_uri =
+                            params.get("redirect_uri").cloned().expect("redirect_uri");
+                        *captured.authorize_redirect.lock().await = Some(redirect_uri.clone());
+                        let mut callback = url::Url::parse(&redirect_uri).expect("callback URL");
+                        callback
+                            .query_pairs_mut()
+                            .append_pair("code", "authorization-code")
+                            .append_pair(
+                                "state",
+                                params.get("state").expect("authorization state"),
+                            );
+                        Redirect::temporary(callback.as_str())
+                    },
+                ),
+            )
+            .route(
+                "/token",
+                post(
+                    |State(captured): State<Captured>,
+                     Form(params): Form<HashMap<String, String>>| async move {
+                        *captured.token_redirect.lock().await = params.get("redirect_uri").cloned();
+                        *captured.verifier.lock().await = params.get("code_verifier").cloned();
+                        Json(serde_json::json!({
+                            "access_token": "access-token",
+                            "refresh_token": "refresh-token",
+                            "expires_in": 3600
+                        }))
+                    },
+                ),
+            )
+            .with_state(captured.clone());
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let (metadata, vault, crypto) = setup();
+        let mut provider = oauth_provider("oauth");
+        provider.auth_url = Some(format!("http://{address}/authorize"));
+        provider.token_url = Some(format!("http://{address}/token"));
+        provider.allow_private_network = true;
+        metadata
+            .insert_provider(&provider)
+            .expect("insert provider");
+        let app = AuthApp::new(&metadata, &vault, &crypto);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            app.login_oauth_pkce_with_authorizer("oauth", |authorize_url| {
+                tokio::spawn(async move {
+                    reqwest::get(authorize_url)
+                        .await
+                        .expect("open authorization URL");
+                });
+            }),
+        )
+        .await
+        .expect("OAuth test timeout")
+        .expect("OAuth login");
+        server_task.abort();
+
+        let authorize_redirect = captured
+            .authorize_redirect
+            .lock()
+            .await
+            .clone()
+            .expect("authorize redirect");
+        let token_redirect = captured
+            .token_redirect
+            .lock()
+            .await
+            .clone()
+            .expect("token redirect");
+        assert_eq!(authorize_redirect, token_redirect);
+        assert!(authorize_redirect.starts_with("http://127.0.0.1:"));
+        assert!(captured
+            .verifier
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|verifier| !verifier.is_empty()));
+        assert!(metadata
+            .get_latest_session("oauth")
+            .expect("session lookup")
+            .is_some());
+    }
+
+    #[test]
     fn store_oauth_session_persists_token_secret_and_expiry() {
         let (metadata, vault, crypto) = setup();
         let app = AuthApp::new(&metadata, &vault, &crypto);
@@ -572,6 +1016,8 @@ mod tests {
             access_token: "access-1".to_string(),
             refresh_token: Some("refresh-1".to_string()),
             expires_in: Some(600),
+            scope: None,
+            token_type: Some("Bearer".into()),
         };
 
         app.store_oauth_session("oauth", &token, &["scope:x".to_string()])
@@ -592,8 +1038,14 @@ mod tests {
         let plaintext = crypto.decrypt(&cipher, &nonce).expect("decrypt");
         let value: serde_json::Value =
             serde_json::from_slice(&plaintext).expect("token payload should be valid JSON");
-        assert_eq!(value.get("access_token").and_then(|v| v.as_str()), Some("access-1"));
-        assert_eq!(value.get("refresh_token").and_then(|v| v.as_str()), Some("refresh-1"));
+        assert_eq!(
+            value.get("access_token").and_then(|v| v.as_str()),
+            Some("access-1")
+        );
+        assert_eq!(
+            value.get("refresh_token").and_then(|v| v.as_str()),
+            Some("refresh-1")
+        );
     }
 
     #[test]
@@ -604,6 +1056,8 @@ mod tests {
             access_token: "access-1".to_string(),
             refresh_token: Some("refresh-1".to_string()),
             expires_in: None,
+            scope: None,
+            token_type: Some("Bearer".into()),
         };
 
         app.store_oauth_session("oauth", &token, &["scope:x".to_string()])
@@ -625,7 +1079,9 @@ mod tests {
         let (metadata, vault, crypto) = setup();
         let mut provider = oauth_provider("oauth");
         provider.client_id = None;
-        metadata.insert_provider(&provider).expect("insert provider");
+        metadata
+            .insert_provider(&provider)
+            .expect("insert provider");
         let app = AuthApp::new(&metadata, &vault, &crypto);
 
         let err = app
@@ -640,7 +1096,9 @@ mod tests {
         let (metadata, vault, crypto) = setup();
         let mut provider = oauth_provider("oauth");
         provider.auth_url = None;
-        metadata.insert_provider(&provider).expect("insert provider");
+        metadata
+            .insert_provider(&provider)
+            .expect("insert provider");
         let app = AuthApp::new(&metadata, &vault, &crypto);
 
         let err = app
@@ -655,7 +1113,9 @@ mod tests {
         let (metadata, vault, crypto) = setup();
         let mut provider = oauth_provider("oauth");
         provider.token_url = None;
-        metadata.insert_provider(&provider).expect("insert provider");
+        metadata
+            .insert_provider(&provider)
+            .expect("insert provider");
         let app = AuthApp::new(&metadata, &vault, &crypto);
 
         let err = app
@@ -711,7 +1171,9 @@ mod tests {
     async fn refresh_oauth_token_fails_on_invalid_secret_json() {
         let (metadata, vault, crypto) = setup();
         let provider = oauth_provider("oauth");
-        metadata.insert_provider(&provider).expect("insert provider");
+        metadata
+            .insert_provider(&provider)
+            .expect("insert provider");
 
         let (cipher, nonce) = crypto.encrypt(b"not-json").expect("encrypt");
         vault
@@ -721,6 +1183,8 @@ mod tests {
         let session = SessionRecord {
             session_id: "sess-1".to_string(),
             provider_id: provider.id.clone(),
+            principal_id: "local-user".into(),
+            tenant_id: "local".into(),
             scopes: provider.scopes.clone(),
             expires_at: Some(Utc::now() - Duration::seconds(10)),
             secret_id: "secret1".to_string(),
@@ -739,7 +1203,9 @@ mod tests {
     async fn refresh_oauth_token_fails_when_refresh_token_is_missing() {
         let (metadata, vault, crypto) = setup();
         let provider = oauth_provider("oauth");
-        metadata.insert_provider(&provider).expect("insert provider");
+        metadata
+            .insert_provider(&provider)
+            .expect("insert provider");
 
         let payload = serde_json::json!({ "access_token": "a-only" }).to_string();
         let (cipher, nonce) = crypto.encrypt(payload.as_bytes()).expect("encrypt");
@@ -750,6 +1216,8 @@ mod tests {
         let session = SessionRecord {
             session_id: "sess-1".to_string(),
             provider_id: provider.id.clone(),
+            principal_id: "local-user".into(),
+            tenant_id: "local".into(),
             scopes: provider.scopes.clone(),
             expires_at: Some(Utc::now() - Duration::seconds(10)),
             secret_id: "secret1".to_string(),
@@ -769,7 +1237,9 @@ mod tests {
         let (metadata, vault, crypto) = setup();
         let mut provider = oauth_provider("oauth");
         provider.client_id = None;
-        metadata.insert_provider(&provider).expect("insert provider");
+        metadata
+            .insert_provider(&provider)
+            .expect("insert provider");
 
         let payload = serde_json::json!({
             "access_token": "a",
@@ -784,6 +1254,8 @@ mod tests {
         let session = SessionRecord {
             session_id: "sess-1".to_string(),
             provider_id: provider.id.clone(),
+            principal_id: "local-user".into(),
+            tenant_id: "local".into(),
             scopes: provider.scopes.clone(),
             expires_at: Some(Utc::now() - Duration::seconds(10)),
             secret_id: "secret1".to_string(),
@@ -802,11 +1274,15 @@ mod tests {
     async fn refresh_oauth_token_returns_early_when_token_not_expiring() {
         let (metadata, vault, crypto) = setup();
         let provider = oauth_provider("oauth");
-        metadata.insert_provider(&provider).expect("insert provider");
+        metadata
+            .insert_provider(&provider)
+            .expect("insert provider");
 
         let session = SessionRecord {
             session_id: "sess-1".to_string(),
             provider_id: provider.id.clone(),
+            principal_id: "local-user".into(),
+            tenant_id: "local".into(),
             scopes: provider.scopes.clone(),
             expires_at: Some(Utc::now() + Duration::minutes(10)),
             secret_id: "missing-secret-ok".to_string(),
@@ -816,5 +1292,150 @@ mod tests {
         let app = AuthApp::new(&metadata, &vault, &crypto);
         let result = app.refresh_oauth_token("oauth").await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn refresh_is_bound_to_the_requested_principal_and_tenant() {
+        use axum::{extract::Form, routing::post, Json, Router};
+        use serde_json::Value;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind token endpoint");
+        let address = listener.local_addr().expect("token endpoint");
+        let router = Router::new().route(
+            "/token",
+            post(|Form(form): Form<HashMap<String, String>>| async move {
+                assert_eq!(
+                    form.get("refresh_token").map(String::as_str),
+                    Some("remote-refresh")
+                );
+                Json(serde_json::json!({
+                    "access_token": "remote-access-new",
+                    "refresh_token": "remote-refresh-new",
+                    "expires_in": 600,
+                    "scope": "scope:remote",
+                    "token_type": "Bearer"
+                }))
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let (metadata, vault, crypto) = setup();
+        let mut provider = oauth_provider("oauth");
+        provider.token_url = Some(format!("http://{address}/token"));
+        provider.allow_private_network = true;
+        metadata.insert_provider(&provider).expect("provider");
+
+        for (session_id, principal, tenant, secret_id, refresh) in [
+            (
+                "local-session",
+                "local-user",
+                "local",
+                "local-secret",
+                "local-refresh",
+            ),
+            (
+                "remote-session",
+                "remote-user",
+                "tenant-1",
+                "remote-secret",
+                "remote-refresh",
+            ),
+        ] {
+            let payload = serde_json::json!({
+                "access_token": format!("{principal}-old"),
+                "refresh_token": refresh
+            })
+            .to_string();
+            let (cipher, nonce) = crypto.encrypt(payload.as_bytes()).expect("encrypt");
+            vault
+                .insert_secret(secret_id, "oauth_token", &cipher, &nonce)
+                .expect("secret");
+            metadata
+                .insert_session(&SessionRecord {
+                    session_id: session_id.into(),
+                    provider_id: "oauth".into(),
+                    principal_id: principal.into(),
+                    tenant_id: tenant.into(),
+                    scopes: vec!["scope:old".into()],
+                    expires_at: Some(Utc::now() - Duration::seconds(10)),
+                    secret_id: secret_id.into(),
+                })
+                .expect("session");
+        }
+
+        let app = AuthApp::new(&metadata, &vault, &crypto);
+        app.refresh_oauth_token_for("oauth", "remote-user", "tenant-1")
+            .await
+            .expect("remote refresh");
+        server.abort();
+
+        let remote = metadata
+            .get_latest_session_for("oauth", "remote-user", "tenant-1")
+            .expect("remote lookup")
+            .expect("remote session");
+        assert_eq!(remote.scopes, vec!["scope:remote"]);
+        let (cipher, nonce) = vault
+            .get_secret("remote-secret")
+            .expect("remote secret")
+            .expect("remote secret exists");
+        let remote_secret: Value =
+            serde_json::from_slice(&crypto.decrypt(&cipher, &nonce).expect("decrypt remote"))
+                .expect("remote JSON");
+        assert_eq!(remote_secret["access_token"], "remote-access-new");
+
+        let (cipher, nonce) = vault
+            .get_secret("local-secret")
+            .expect("local secret")
+            .expect("local secret exists");
+        let local_secret: Value =
+            serde_json::from_slice(&crypto.decrypt(&cipher, &nonce).expect("decrypt local"))
+                .expect("local JSON");
+        assert_eq!(local_secret["access_token"], "local-user-old");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_responses_are_bounded_and_error_bodies_are_not_exposed() {
+        use axum::{http::StatusCode, routing::get, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let router = Router::new()
+            .route("/large", get(|| async { "x".repeat(70 * 1024) }))
+            .route(
+                "/error",
+                get(|| async { (StatusCode::BAD_REQUEST, "upstream-sensitive-details") }),
+            );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let client = Client::new();
+
+        let large = client
+            .get(format!("http://{address}/large"))
+            .send()
+            .await
+            .expect("large response");
+        assert!(matches!(
+            parse_token_response(large, "Token exchange").await,
+            Err(CliError::ResponseTooLarge { .. })
+        ));
+
+        let error_response = client
+            .get(format!("http://{address}/error"))
+            .send()
+            .await
+            .expect("error response");
+        let error = parse_token_response(error_response, "Token exchange")
+            .await
+            .expect_err("error response");
+        assert!(!error.to_string().contains("upstream-sensitive-details"));
+        assert!(error.to_string().contains("HTTP 400"));
+        server.abort();
     }
 }

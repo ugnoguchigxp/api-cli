@@ -5,9 +5,21 @@ use serde::{Deserialize, Serialize};
 pub struct SessionRecord {
     pub session_id: String,
     pub provider_id: String,
+    #[serde(default = "default_principal_id")]
+    pub principal_id: String,
+    #[serde(default = "default_tenant_id")]
+    pub tenant_id: String,
     pub scopes: Vec<String>,
     pub expires_at: Option<DateTime<Utc>>,
     pub secret_id: String,
+}
+
+fn default_principal_id() -> String {
+    "local-user".into()
+}
+
+fn default_tenant_id() -> String {
+    "local".into()
 }
 
 #[cfg(test)]
@@ -21,6 +33,8 @@ mod tests {
         let session = SessionRecord {
             session_id: "sess-1".to_string(),
             provider_id: "p1".to_string(),
+            principal_id: "local-user".into(),
+            tenant_id: "local".into(),
             scopes: vec!["read".to_string()],
             expires_at: Some(now),
             secret_id: "sec-1".to_string(),

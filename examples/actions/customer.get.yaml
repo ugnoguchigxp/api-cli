@@ -1,0 +1,49 @@
+api_version: apicli.dev/v1alpha1
+kind: Action
+
+metadata:
+  name: customer.get
+  version: 1
+  description: Get a customer by ID
+  enabled: false
+
+spec:
+  input_schema:
+    type: object
+    additionalProperties: false
+    properties:
+      customer_id:
+        type: string
+        minLength: 1
+      expand:
+        type: boolean
+    required:
+      - customer_id
+
+  output_schema:
+    type: object
+
+  executor:
+    kind: openapi
+    provider: crm
+    operation_id: getCustomer
+    method: GET
+    path: /customers/{customer_id}
+    parameters:
+      customer_id: path
+      expand: query
+
+  risk: read
+  approval: never
+
+  broker_scopes:
+    - customer:read
+  upstream_scopes:
+    - crm.customer.read
+
+  constraints:
+    timeout_ms: 10000
+    max_response_bytes: 1048576
+    response_mask:
+      - /email
+      - /phone
