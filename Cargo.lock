@@ -134,7 +134,7 @@ dependencies = [
  "assert_cmd",
  "async-trait",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.0",
  "chrono",
  "clap",
  "directories",
