@@ -43,9 +43,31 @@ const proxy = createApiProxyServer({
     mode: 'forward-header',
     sourceHeaderName: 'authorization',
     targetHeaderName: 'authorization'
+  },
+  allowedMethods: ['GET'],
+  allowedPathPrefixes: ['/v1/invoices'],
+  limits: {
+    maxRequestBytes: 1048576,
+    maxResponseBytes: 1048576,
+    maxErrorBytes: 65536
   }
 });
 ```
+
+proxyは既定で`GET`/`HEAD`だけを許可し、path policyの指定を必須とします。任意pathを
+許可する`dangerouslyAllowAnyTargetPath`は、上流credentialで到達できる全APIを呼び出し元へ
+公開するため、信頼済み・認証済みの内部用途以外では使用しないでください。redirectは追従せず、
+request/response/error bodyは上限を超えると拒否されます。
+`localhost`やprivate/special-purpose IPは既定で拒否され、内部APIを意図して公開するproviderだけ
+`allowPrivateNetwork: true`を設定します。既定のHTTP実装はhostnameを接続時に解決し、解決候補に
+private/special-purpose addressが1件でも含まれる場合は接続を拒否します。独自の`fetchImpl`を
+注入する場合は、このDNS検証を含むegress policyを実装側で保証してください。provider設定自体も
+信頼済み管理面からのみ更新してください。cleartext HTTPの開発用例外は、DNSで意味が変わり得る
+`localhost`ではなく、明示的なloopback IP（`127.0.0.1`または`[::1]`）だけに限定されます。
+
+`parseAs: 'raw'`ではバイナリbodyを文字列化せず転送します。転送時は`set-cookie`、
+`content-length`、`content-encoding`など、再構築後のbodyと不整合またはhop-by-hopとなるheaderを
+除去します。
 
 ### ワンライナー導入
 

@@ -7,6 +7,8 @@ use chrono::Utc;
 use rpassword;
 use uuid::Uuid;
 
+const MAX_CREDENTIAL_BYTES: usize = 64 * 1024;
+
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::{rngs::OsRng, RngCore};
 use reqwest::Client;
@@ -79,6 +81,17 @@ impl AuthApp {
     }
 
     pub fn login_api_key(&self, provider_id: &str, api_key: Option<&str>) -> Result<()> {
+        self.login_api_key_for(provider_id, api_key, "local-user", "local")
+    }
+
+    pub fn login_api_key_for(
+        &self,
+        provider_id: &str,
+        api_key: Option<&str>,
+        principal_id: &str,
+        tenant_id: &str,
+    ) -> Result<()> {
+        validate_credential_subject(principal_id, tenant_id)?;
         let provider = self
             .metadata_db
             .get_provider(provider_id)?
@@ -101,34 +114,52 @@ impl AuthApp {
         if key.is_empty() {
             return Err(CliError::AuthRequired);
         }
+        if key.len() > MAX_CREDENTIAL_BYTES {
+            return Err(CliError::InvalidInput(format!(
+                "API key exceeds the {MAX_CREDENTIAL_BYTES} byte limit"
+            )));
+        }
 
         let secret_id = format!("apikey_{}_{}", provider_id, Uuid::new_v4());
         let (cipher_text, nonce) = self.crypto.encrypt(key.as_bytes())?;
 
-        self.vault_db
-            .insert_secret(&secret_id, "api_key", &cipher_text, &nonce)?;
-
         let session = SessionRecord {
             session_id: format!("sess_{}", Uuid::new_v4()),
             provider_id: provider_id.to_string(),
-            principal_id: "local-user".into(),
-            tenant_id: "local".into(),
+            principal_id: principal_id.into(),
+            tenant_id: tenant_id.into(),
             scopes: provider.scopes.clone(),
             expires_at: None,
             secret_id,
         };
-        self.metadata_db.insert_session(&session)?;
+        self.persist_new_session(&session, "api_key", &cipher_text, &nonce)?;
 
         Ok(())
     }
 
     pub async fn login_oauth_pkce(&self, provider_id: &str) -> Result<()> {
-        self.login_oauth_pkce_with_authorizer(provider_id, |authorize_url| {
-            println!("Open this URL in your browser:\n{}\n", authorize_url);
-        })
+        self.login_oauth_pkce_for(provider_id, "local-user", "local")
+            .await
+    }
+
+    pub async fn login_oauth_pkce_for(
+        &self,
+        provider_id: &str,
+        principal_id: &str,
+        tenant_id: &str,
+    ) -> Result<()> {
+        self.login_oauth_pkce_for_with_authorizer(
+            provider_id,
+            principal_id,
+            tenant_id,
+            |authorize_url| {
+                eprintln!("Open this URL in your browser:\n{}\n", authorize_url);
+            },
+        )
         .await
     }
 
+    #[cfg(test)]
     async fn login_oauth_pkce_with_authorizer<F>(
         &self,
         provider_id: &str,
@@ -137,6 +168,21 @@ impl AuthApp {
     where
         F: FnOnce(url::Url),
     {
+        self.login_oauth_pkce_for_with_authorizer(provider_id, "local-user", "local", authorize)
+            .await
+    }
+
+    async fn login_oauth_pkce_for_with_authorizer<F>(
+        &self,
+        provider_id: &str,
+        principal_id: &str,
+        tenant_id: &str,
+        authorize: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(url::Url),
+    {
+        validate_credential_subject(principal_id, tenant_id)?;
         let provider = self
             .metadata_db
             .get_provider(provider_id)?
@@ -216,7 +262,13 @@ impl AuthApp {
             .await?;
 
         // 5. Store secrets and session
-        self.store_oauth_session(provider_id, &token_result, &provider.scopes)?;
+        self.store_oauth_session_for(
+            provider_id,
+            &token_result,
+            &provider.scopes,
+            principal_id,
+            tenant_id,
+        )?;
 
         Ok(())
     }
@@ -332,7 +384,7 @@ impl AuthApp {
         let addr = listener
             .local_addr()
             .map_err(|e| CliError::Internal(e.to_string()))?;
-        println!("Waiting for callback on http://{addr}/callback ...");
+        eprintln!("Waiting for callback on http://{addr}/callback ...");
 
         tokio::select! {
             result = rx => {
@@ -379,11 +431,23 @@ impl AuthApp {
         parse_token_response(response, "Token exchange").await
     }
 
+    #[cfg(test)]
     fn store_oauth_session(
         &self,
         provider_id: &str,
         token_result: &TokenResponse,
         scopes: &[String],
+    ) -> Result<()> {
+        self.store_oauth_session_for(provider_id, token_result, scopes, "local-user", "local")
+    }
+
+    fn store_oauth_session_for(
+        &self,
+        provider_id: &str,
+        token_result: &TokenResponse,
+        scopes: &[String],
+        principal_id: &str,
+        tenant_id: &str,
     ) -> Result<()> {
         if token_result.access_token.is_empty() {
             return Err(CliError::Internal(
@@ -399,9 +463,6 @@ impl AuthApp {
         let secret_id = format!("oauth_{}_{}", provider_id, Uuid::new_v4());
         let (cipher_text, nonce) = self.crypto.encrypt(secret_str.as_bytes())?;
 
-        self.vault_db
-            .insert_secret(&secret_id, "oauth_token", &cipher_text, &nonce)?;
-
         let expires_at = token_expiry(token_result.expires_in)?;
         let granted_scopes = match token_result.scope.as_deref() {
             Some(scope) => parse_scope(scope)?,
@@ -411,13 +472,13 @@ impl AuthApp {
         let session = SessionRecord {
             session_id: format!("sess_{}", Uuid::new_v4()),
             provider_id: provider_id.to_string(),
-            principal_id: "local-user".into(),
-            tenant_id: "local".into(),
+            principal_id: principal_id.into(),
+            tenant_id: tenant_id.into(),
             scopes: granted_scopes,
             expires_at,
             secret_id,
         };
-        self.metadata_db.insert_session(&session)?;
+        self.persist_new_session(&session, "oauth_token", &cipher_text, &nonce)?;
 
         Ok(())
     }
@@ -434,6 +495,7 @@ impl AuthApp {
         principal_id: &str,
         tenant_id: &str,
     ) -> Result<()> {
+        validate_credential_subject(principal_id, tenant_id)?;
         let _guard = self.refresh_lock.lock().await;
 
         let provider = self
@@ -475,6 +537,7 @@ impl AuthApp {
         let refresh_token_str = secret_json
             .get("refresh_token")
             .and_then(|v| v.as_str())
+            .filter(|token| !token.is_empty())
             .ok_or_else(|| CliError::Internal("No refresh_token found in vault".into()))?;
 
         let client_id = provider
@@ -507,7 +570,10 @@ impl AuthApp {
         let access_token = token_result.access_token;
         // Fallback to old refresh token if new one is not returned
         let base_refresh = refresh_token_str.to_string();
-        let final_refresh_token = token_result.refresh_token.unwrap_or(base_refresh);
+        let final_refresh_token = token_result
+            .refresh_token
+            .filter(|token| !token.is_empty())
+            .unwrap_or(base_refresh);
         let expires_at = token_expiry(token_result.expires_in)?;
         let granted_scopes = token_result.scope.as_deref().map(parse_scope).transpose()?;
 
@@ -517,18 +583,75 @@ impl AuthApp {
         });
 
         let secret_str = payload.to_string();
+        let new_secret_id = format!("oauth_{}_{}", provider_id, Uuid::new_v4());
         let (new_cipher, new_nonce) = self.crypto.encrypt(secret_str.as_bytes())?;
 
         self.vault_db
-            .insert_secret(&session.secret_id, "oauth_token", &new_cipher, &new_nonce)?;
+            .insert_secret(&new_secret_id, "oauth_token", &new_cipher, &new_nonce)?;
 
+        let old_secret_id = session.secret_id.clone();
         let mut updated_session = session;
         updated_session.expires_at = expires_at;
+        updated_session.secret_id = new_secret_id.clone();
         if let Some(scopes) = granted_scopes {
             updated_session.scopes = scopes;
         }
-        self.metadata_db.insert_session(&updated_session)?;
+        let replaced = match self
+            .metadata_db
+            .update_session_if_secret_is_current(&updated_session, &old_secret_id)
+        {
+            Ok(replaced) => replaced,
+            Err(error) => {
+                if let Err(cleanup_error) = self.vault_db.delete_secret(&new_secret_id) {
+                    tracing::warn!(error = %cleanup_error, "Failed to remove an unreferenced refreshed credential");
+                }
+                return Err(error);
+            }
+        };
+        if !replaced {
+            if let Err(error) = self.vault_db.delete_secret(&new_secret_id) {
+                tracing::warn!(error = %error, "Failed to remove a credential from a lost refresh race");
+            }
+            let refreshed_elsewhere = self
+                .metadata_db
+                .get_latest_session_for(provider_id, principal_id, tenant_id)?
+                .is_some_and(|current| current.secret_id != old_secret_id);
+            return if refreshed_elsewhere {
+                Ok(())
+            } else {
+                Err(CliError::AuthExpired)
+            };
+        }
+        if let Err(error) = self.vault_db.delete_secret(&old_secret_id) {
+            tracing::warn!(error = %error, "Failed to remove a superseded OAuth credential");
+        }
 
+        Ok(())
+    }
+
+    fn persist_new_session(
+        &self,
+        session: &SessionRecord,
+        kind: &str,
+        cipher_text: &[u8],
+        nonce: &[u8],
+    ) -> Result<()> {
+        self.vault_db
+            .insert_secret(&session.secret_id, kind, cipher_text, nonce)?;
+        let superseded = match self.metadata_db.replace_session_for_subject(session) {
+            Ok(secret_ids) => secret_ids,
+            Err(error) => {
+                if let Err(cleanup_error) = self.vault_db.delete_secret(&session.secret_id) {
+                    tracing::warn!(error = %cleanup_error, "Failed to remove an unreferenced credential");
+                }
+                return Err(error);
+            }
+        };
+        for secret_id in superseded {
+            if let Err(error) = self.vault_db.delete_secret(&secret_id) {
+                tracing::warn!(error = %error, "Failed to remove a superseded credential");
+            }
+        }
         Ok(())
     }
 
@@ -539,6 +662,21 @@ impl AuthApp {
             &self.public_client
         }
     }
+}
+
+fn validate_credential_subject(principal_id: &str, tenant_id: &str) -> Result<()> {
+    for (field, value) in [("principal_id", principal_id), ("tenant_id", tenant_id)] {
+        if value.is_empty()
+            || value.len() > 256
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            return Err(CliError::InvalidInput(format!(
+                "{field} must be 1..=256 characters without surrounding whitespace or control characters"
+            )));
+        }
+    }
+    Ok(())
 }
 
 async fn parse_token_response(
@@ -702,6 +840,25 @@ mod tests {
     }
 
     #[test]
+    fn login_api_key_rejects_oversized_credentials() {
+        let (metadata, vault, crypto) = setup();
+        metadata
+            .insert_provider(&api_key_provider("p1"))
+            .expect("insert provider");
+        let app = AuthApp::new(&metadata, &vault, &crypto);
+
+        assert!(matches!(
+            app.login_api_key("p1", Some(&"x".repeat(MAX_CREDENTIAL_BYTES + 1))),
+            Err(CliError::InvalidInput(_))
+        ));
+        assert!(metadata
+            .get_latest_session("p1")
+            .expect("session lookup")
+            .is_none());
+        assert!(!vault.has_secrets().expect("vault lookup"));
+    }
+
+    #[test]
     fn login_api_key_rejects_oauth_provider() {
         let (metadata, vault, crypto) = setup();
         metadata
@@ -742,6 +899,57 @@ mod tests {
             .expect("secret exists");
         let decrypted = crypto.decrypt(&cipher, &nonce).expect("decrypt");
         assert_eq!(decrypted, b"secret-123");
+
+        let old_session_id = session.session_id;
+        let old_secret_id = session.secret_id;
+        app.login_api_key("p1", Some("replacement"))
+            .expect("replace login");
+        assert!(metadata
+            .get_session(&old_session_id)
+            .expect("old session lookup")
+            .is_none());
+        assert!(vault
+            .get_secret(&old_secret_id)
+            .expect("old secret lookup")
+            .is_none());
+        let replacement = metadata
+            .get_latest_session("p1")
+            .expect("replacement lookup")
+            .expect("replacement session");
+        let (cipher, nonce) = vault
+            .get_secret(&replacement.secret_id)
+            .expect("replacement vault read")
+            .expect("replacement secret");
+        assert_eq!(
+            crypto
+                .decrypt(&cipher, &nonce)
+                .expect("decrypt replacement"),
+            b"replacement"
+        );
+    }
+
+    #[test]
+    fn api_key_can_be_preprovisioned_for_an_exact_remote_subject() {
+        let (metadata, vault, crypto) = setup();
+        metadata
+            .insert_provider(&api_key_provider("p1"))
+            .expect("provider");
+        let app = AuthApp::new(&metadata, &vault, &crypto);
+        app.login_api_key_for("p1", Some("secret"), "remote-user", "tenant-1")
+            .expect("remote login");
+
+        assert!(metadata
+            .get_latest_session_for("p1", "remote-user", "tenant-1")
+            .expect("lookup")
+            .is_some());
+        assert!(metadata
+            .get_latest_session_for("p1", "remote-user", "tenant-2")
+            .expect("cross-tenant lookup")
+            .is_none());
+        assert!(matches!(
+            app.login_api_key_for("p1", Some("secret"), " remote-user", "tenant-1"),
+            Err(CliError::InvalidInput(_))
+        ));
     }
 
     #[test]
@@ -1378,8 +1586,13 @@ mod tests {
             .expect("remote lookup")
             .expect("remote session");
         assert_eq!(remote.scopes, vec!["scope:remote"]);
-        let (cipher, nonce) = vault
+        assert_ne!(remote.secret_id, "remote-secret");
+        assert!(vault
             .get_secret("remote-secret")
+            .expect("superseded remote secret lookup")
+            .is_none());
+        let (cipher, nonce) = vault
+            .get_secret(&remote.secret_id)
             .expect("remote secret")
             .expect("remote secret exists");
         let remote_secret: Value =

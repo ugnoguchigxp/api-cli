@@ -57,20 +57,20 @@ describe("context helpers", () => {
   });
 
   it("can include raw headers in metadata", () => {
-    const context = createContextFromHeaders(
-      {
-        "x-tenant-id": "tenant-3",
-        "x-user-id": "user-3",
-      },
-      {
-        includeRawHeadersInMetadata: true,
-      },
-    );
+    const rawHeaders = {
+      "X-Tenant-ID": "tenant-3",
+      "x-user-id": ["user-3"],
+    };
+    const context = createContextFromHeaders(rawHeaders, {
+      includeRawHeadersInMetadata: true,
+    });
 
     expect(context.tenantId).toBe("tenant-3");
     expect(context.metadata).toBeDefined();
-    const headers = context.metadata?.headers as Record<string, string>;
-    expect(headers["x-tenant-id"]).toBe("tenant-3");
-    expect(headers["x-user-id"]).toBe("user-3");
+    const headers = context.metadata?.headers as Record<string, string | string[]>;
+    expect(headers["X-Tenant-ID"]).toBe("tenant-3");
+    expect(headers["x-user-id"]).toEqual(["user-3"]);
+    rawHeaders["x-user-id"].push("mutated");
+    expect(headers["x-user-id"]).toEqual(["user-3"]);
   });
 });

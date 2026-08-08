@@ -1,9 +1,12 @@
 use crate::domain::provider::ProviderConfig;
 use crate::domain::session::SessionRecord;
 use crate::error::{CliError, Result};
-use crate::infra::db::run_db;
-use rusqlite::{params, Connection};
-use std::sync::{Arc, Mutex, MutexGuard};
+use crate::infra::db::{enable_wal, run_db, DbConnection, SqlitePool};
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{params, Connection, TransactionBehavior};
+use serde::Serialize;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 const LATEST_SCHEMA_VERSION: i64 = 4;
 
@@ -39,6 +42,24 @@ pub struct AuditEventRecord {
     pub error_code: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct AuditEventView {
+    pub event_id: String,
+    pub principal_id: String,
+    pub tenant_id: String,
+    pub client_id: String,
+    pub approval_ticket_id: Option<String>,
+    pub action_name: String,
+    pub action_version: u32,
+    pub definition_hash: String,
+    pub provider_id: String,
+    pub arguments_hash: String,
+    pub risk: String,
+    pub outcome: String,
+    pub error_code: Option<String>,
+    pub created_at: String,
+}
+
 pub struct ApprovalTicketBinding<'a> {
     pub ticket_id: &'a str,
     pub principal_id: &'a str,
@@ -54,29 +75,61 @@ pub struct ApprovalTicketBinding<'a> {
 
 #[derive(Clone, Debug)]
 pub struct MetadataDb {
-    conn: Arc<Mutex<Connection>>,
+    connections: MetadataConnections,
+}
+
+#[derive(Clone, Debug)]
+enum MetadataConnections {
+    Single(Arc<Mutex<Connection>>),
+    Pool(SqlitePool),
 }
 
 impl MetadataDb {
     pub fn new(mut conn: Connection) -> Result<Self> {
         Self::migrate(&mut conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            connections: MetadataConnections::Single(Arc::new(Mutex::new(conn))),
+        })
+    }
+
+    pub fn open(path: &Path) -> Result<Self> {
+        let manager = SqliteConnectionManager::file(path).with_init(|connection| {
+            connection.execute_batch(
+                "PRAGMA busy_timeout = 5000;
+                 PRAGMA foreign_keys = ON;",
+            )
+        });
+        let pool = r2d2::Pool::builder()
+            .max_size(8)
+            .connection_timeout(std::time::Duration::from_secs(5))
+            .build(manager)
+            .map_err(|error| CliError::Internal(format!("metadata database pool: {error}")))?;
+        {
+            let mut connection = pool
+                .get()
+                .map_err(|error| CliError::Internal(format!("metadata database pool: {error}")))?;
+            Self::migrate(&mut connection)?;
+        }
+        Ok(Self {
+            connections: MetadataConnections::Pool(pool),
         })
     }
 
     fn migrate(conn: &mut Connection) -> Result<()> {
         conn.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA busy_timeout = 5000;
+            "PRAGMA busy_timeout = 5000;
              PRAGMA foreign_keys = ON;
              CREATE TABLE IF NOT EXISTS schema_version (
                  version INTEGER PRIMARY KEY,
                  applied_at TEXT NOT NULL
              );",
         )?;
+        enable_wal(conn)?;
 
-        let current: i64 = conn.query_row(
+        // Hold the SQLite writer lock while reading and advancing the version so
+        // independent CLI processes cannot both attempt the same migration.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
             [],
             |row| row.get(0),
@@ -90,7 +143,6 @@ impl MetadataDb {
         }
 
         if current < 1 {
-            let tx = conn.transaction()?;
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS providers (
                      id TEXT PRIMARY KEY,
@@ -113,10 +165,8 @@ impl MetadataDb {
                 "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                 params![1_i64, chrono::Utc::now().to_rfc3339()],
             )?;
-            tx.commit()?;
         }
         if current < 2 {
-            let tx = conn.transaction()?;
             tx.execute_batch(
                 "CREATE TABLE approval_tickets (
                      ticket_id TEXT PRIMARY KEY,
@@ -163,10 +213,8 @@ impl MetadataDb {
                 "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                 params![2_i64, chrono::Utc::now().to_rfc3339()],
             )?;
-            tx.commit()?;
         }
         if current < 3 {
-            let tx = conn.transaction()?;
             tx.execute_batch(
                 "ALTER TABLE sessions
                      ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'local-user';
@@ -193,10 +241,8 @@ impl MetadataDb {
                 "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                 params![3_i64, chrono::Utc::now().to_rfc3339()],
             )?;
-            tx.commit()?;
         }
         if current < 4 {
-            let tx = conn.transaction()?;
             tx.execute_batch(
                 "ALTER TABLE audit_events
                      ADD COLUMN approval_ticket_id TEXT;
@@ -208,15 +254,22 @@ impl MetadataDb {
                 "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                 params![4_i64, chrono::Utc::now().to_rfc3339()],
             )?;
-            tx.commit()?;
         }
+        tx.commit()?;
         Ok(())
     }
 
-    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.conn
-            .lock()
-            .map_err(|_| CliError::Internal("Metadata database lock poisoned".into()))
+    fn connection(&self) -> Result<DbConnection<'_>> {
+        match &self.connections {
+            MetadataConnections::Single(connection) => connection
+                .lock()
+                .map(DbConnection::Single)
+                .map_err(|_| CliError::Internal("Metadata database lock poisoned".into())),
+            MetadataConnections::Pool(pool) => pool
+                .get()
+                .map(DbConnection::Pooled)
+                .map_err(|error| CliError::Internal(format!("metadata database pool: {error}"))),
+        }
     }
 
     #[cfg(test)]
@@ -368,36 +421,100 @@ impl MetadataDb {
 
     pub fn insert_session(&self, session: &SessionRecord) -> Result<()> {
         run_db(|| {
-            let json = serde_json::to_string(session).map_err(|e| {
-                crate::error::CliError::Internal(format!("Failed to serialize session: {}", e))
-            })?;
-            let expires_at = session.expires_at.map(|d| d.to_rfc3339());
-            let now = chrono::Utc::now().to_rfc3339();
+            let connection = self.connection()?;
+            upsert_session(&connection, session)
+        })
+    }
 
-            self.connection()?.execute(
-                "INSERT INTO sessions (
-                     session_id, provider_id, principal_id, tenant_id, config_json,
-                     expires_at, created_at, updated_at
-                 )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
-                 ON CONFLICT(session_id) DO UPDATE SET
-                     provider_id=excluded.provider_id,
-                     principal_id=excluded.principal_id,
-                     tenant_id=excluded.tenant_id,
-                     config_json=excluded.config_json,
-                     expires_at=excluded.expires_at,
-                     updated_at=excluded.updated_at",
+    /// Updates a session only while it still references the credential that
+    /// was used to produce the replacement. This prevents concurrent OAuth
+    /// refreshes from overwriting a newer login or refresh.
+    pub fn update_session_if_secret_is_current(
+        &self,
+        session: &SessionRecord,
+        expected_secret_id: &str,
+    ) -> Result<bool> {
+        run_db(|| {
+            let json = serde_json::to_string(session).map_err(|error| {
+                CliError::Internal(format!("Failed to serialize session: {error}"))
+            })?;
+            let expires_at = session.expires_at.map(|date| date.to_rfc3339());
+            let changed = self.connection()?.execute(
+                "UPDATE sessions
+                    SET config_json = ?1, expires_at = ?2, updated_at = ?3
+                  WHERE session_id = ?4
+                    AND provider_id = ?5
+                    AND principal_id = ?6
+                    AND tenant_id = ?7
+                    AND json_extract(config_json, '$.secret_id') = ?8",
                 params![
+                    json,
+                    expires_at,
+                    chrono::Utc::now().to_rfc3339(),
                     session.session_id,
                     session.provider_id,
                     session.principal_id,
                     session.tenant_id,
-                    json,
-                    expires_at,
-                    now
+                    expected_secret_id,
                 ],
             )?;
-            Ok(())
+            Ok(changed == 1)
+        })
+    }
+
+    /// Installs a newly authenticated session and revokes older sessions for
+    /// the same provider subject in one metadata transaction. Returned secret
+    /// IDs can be removed from the separate vault after the commit.
+    pub fn replace_session_for_subject(&self, session: &SessionRecord) -> Result<Vec<String>> {
+        run_db(|| {
+            let mut conn = self.connection()?;
+            let tx = conn.transaction()?;
+            let mut old_secret_ids = std::collections::BTreeSet::new();
+            {
+                let mut statement = tx.prepare(
+                    "SELECT config_json FROM sessions
+                     WHERE provider_id = ?1 AND principal_id = ?2 AND tenant_id = ?3
+                       AND session_id <> ?4",
+                )?;
+                let rows = statement.query_map(
+                    params![
+                        session.provider_id,
+                        session.principal_id,
+                        session.tenant_id,
+                        session.session_id
+                    ],
+                    |row| row.get::<_, String>(0),
+                )?;
+                for row in rows {
+                    let json = row?;
+                    match serde_json::from_str::<SessionRecord>(&json) {
+                        Ok(previous) => {
+                            old_secret_ids.insert(previous.secret_id);
+                        }
+                        Err(error) => tracing::warn!(
+                            provider_id = session.provider_id,
+                            principal_id = session.principal_id,
+                            tenant_id = session.tenant_id,
+                            error = %error,
+                            "Replacing an unreadable session; its orphaned vault record cannot be identified"
+                        ),
+                    }
+                }
+            }
+            upsert_session(&tx, session)?;
+            tx.execute(
+                "DELETE FROM sessions
+                 WHERE provider_id = ?1 AND principal_id = ?2 AND tenant_id = ?3
+                   AND session_id <> ?4",
+                params![
+                    session.provider_id,
+                    session.principal_id,
+                    session.tenant_id,
+                    session.session_id
+                ],
+            )?;
+            tx.commit()?;
+            Ok(old_secret_ids.into_iter().collect())
         })
     }
 
@@ -639,6 +756,111 @@ impl MetadataDb {
             Ok(())
         })
     }
+
+    pub fn list_audit_events(
+        &self,
+        limit: usize,
+        action: Option<&str>,
+        outcome: Option<&str>,
+    ) -> Result<Vec<AuditEventView>> {
+        let limit = limit.clamp(1, 1000) as i64;
+        run_db(|| {
+            let conn = self.connection()?;
+            let mut statement = conn.prepare(
+                "SELECT event_id, principal_id, tenant_id, client_id, approval_ticket_id,
+                        action_name, action_version, definition_hash, provider_id, arguments_hash,
+                        risk, outcome, error_code, created_at
+                   FROM audit_events
+                  WHERE (?1 IS NULL OR action_name = ?1)
+                    AND (?2 IS NULL OR outcome = ?2)
+                  ORDER BY sequence DESC
+                  LIMIT ?3",
+            )?;
+            let rows = statement.query_map(params![action, outcome, limit], |row| {
+                Ok(AuditEventView {
+                    event_id: row.get(0)?,
+                    principal_id: row.get(1)?,
+                    tenant_id: row.get(2)?,
+                    client_id: row.get(3)?,
+                    approval_ticket_id: row.get(4)?,
+                    action_name: row.get(5)?,
+                    action_version: row.get(6)?,
+                    definition_hash: row.get(7)?,
+                    provider_id: row.get(8)?,
+                    arguments_hash: row.get(9)?,
+                    risk: row.get(10)?,
+                    outcome: row.get(11)?,
+                    error_code: row.get(12)?,
+                    created_at: row.get(13)?,
+                })
+            })?;
+            rows.collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(Into::into)
+        })
+    }
+
+    pub fn get_audit_event(&self, event_id: &str) -> Result<Option<AuditEventView>> {
+        run_db(|| {
+            let conn = self.connection()?;
+            let mut statement = conn.prepare(
+                "SELECT event_id, principal_id, tenant_id, client_id, approval_ticket_id,
+                        action_name, action_version, definition_hash, provider_id, arguments_hash,
+                        risk, outcome, error_code, created_at
+                   FROM audit_events WHERE event_id = ?1",
+            )?;
+            let mut rows = statement.query(params![event_id])?;
+            let Some(row) = rows.next()? else {
+                return Ok(None);
+            };
+            Ok(Some(AuditEventView {
+                event_id: row.get(0)?,
+                principal_id: row.get(1)?,
+                tenant_id: row.get(2)?,
+                client_id: row.get(3)?,
+                approval_ticket_id: row.get(4)?,
+                action_name: row.get(5)?,
+                action_version: row.get(6)?,
+                definition_hash: row.get(7)?,
+                provider_id: row.get(8)?,
+                arguments_hash: row.get(9)?,
+                risk: row.get(10)?,
+                outcome: row.get(11)?,
+                error_code: row.get(12)?,
+                created_at: row.get(13)?,
+            }))
+        })
+    }
+}
+
+fn upsert_session(connection: &Connection, session: &SessionRecord) -> Result<()> {
+    let json = serde_json::to_string(session)
+        .map_err(|error| CliError::Internal(format!("Failed to serialize session: {error}")))?;
+    let expires_at = session.expires_at.map(|date| date.to_rfc3339());
+    let now = chrono::Utc::now().to_rfc3339();
+    connection.execute(
+        "INSERT INTO sessions (
+             session_id, provider_id, principal_id, tenant_id, config_json,
+             expires_at, created_at, updated_at
+         )
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)
+         ON CONFLICT(session_id) DO UPDATE SET
+             provider_id=excluded.provider_id,
+             principal_id=excluded.principal_id,
+             tenant_id=excluded.tenant_id,
+             config_json=excluded.config_json,
+             expires_at=excluded.expires_at,
+             updated_at=excluded.updated_at",
+        params![
+            session.session_id,
+            session.provider_id,
+            session.principal_id,
+            session.tenant_id,
+            json,
+            expires_at,
+            now
+        ],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -980,6 +1202,44 @@ mod tests {
     }
 
     #[test]
+    fn conditional_session_update_rejects_a_stale_secret() {
+        let db = setup_db();
+        let mut session = SessionRecord {
+            session_id: "sess".into(),
+            provider_id: "p1".into(),
+            principal_id: "user-1".into(),
+            tenant_id: "tenant-1".into(),
+            scopes: vec!["read".into()],
+            expires_at: None,
+            secret_id: "secret-old".into(),
+        };
+        db.insert_session(&session).expect("insert session");
+
+        session.secret_id = "secret-new".into();
+        assert!(!db
+            .update_session_if_secret_is_current(&session, "secret-stale")
+            .expect("stale update"));
+        assert_eq!(
+            db.get_session("sess")
+                .expect("read session")
+                .expect("session")
+                .secret_id,
+            "secret-old"
+        );
+
+        assert!(db
+            .update_session_if_secret_is_current(&session, "secret-old")
+            .expect("current update"));
+        assert_eq!(
+            db.get_session("sess")
+                .expect("read updated session")
+                .expect("session")
+                .secret_id,
+            "secret-new"
+        );
+    }
+
+    #[test]
     fn deleting_provider_revokes_sessions_and_pending_approvals() {
         let db = setup_db();
         let provider = ProviderConfig {
@@ -1056,5 +1316,97 @@ mod tests {
             db.approval_status("expired-ticket").expect("status"),
             Some("expired".into())
         );
+    }
+
+    #[test]
+    fn audit_events_can_be_filtered_and_fetched_without_secret_payloads() {
+        let db = setup_db();
+        for (event_id, action_name, outcome) in [
+            ("event-1", "customer.get", "succeeded"),
+            ("event-2", "customer.update", "failed"),
+        ] {
+            db.insert_audit_event(&AuditEventRecord {
+                event_id: event_id.into(),
+                principal_id: "user-1".into(),
+                tenant_id: "tenant-1".into(),
+                client_id: "client-1".into(),
+                approval_ticket_id: None,
+                action_name: action_name.into(),
+                action_version: 1,
+                definition_hash: "definition-hash".into(),
+                provider_id: "crm".into(),
+                arguments_hash: "arguments-hash".into(),
+                risk: "read".into(),
+                outcome: outcome.into(),
+                error_code: (outcome == "failed").then(|| "upstream_error".into()),
+            })
+            .expect("insert audit event");
+        }
+
+        let failed = db
+            .list_audit_events(10, None, Some("failed"))
+            .expect("filter audit events");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].event_id, "event-2");
+        let fetched = db
+            .get_audit_event("event-1")
+            .expect("fetch audit event")
+            .expect("event exists");
+        assert_eq!(fetched.arguments_hash, "arguments-hash");
+        assert_eq!(fetched.action_name, "customer.get");
+    }
+
+    #[test]
+    fn file_database_pool_supports_concurrent_writers() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let db = MetadataDb::open(&directory.path().join("metadata.db")).expect("open pool");
+        let handles = (0..8)
+            .map(|index| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    db.insert_provider(&ProviderConfig {
+                        id: format!("provider-{index}"),
+                        base_url: format!("https://api-{index}.example.com"),
+                        auth_type: AuthType::ApiKey,
+                        client_id: None,
+                        auth_url: None,
+                        token_url: None,
+                        scopes: vec![],
+                        credential_placement: CredentialPlacement::Bearer,
+                        oauth_redirect_port: None,
+                        allow_private_network: false,
+                    })
+                    .expect("insert provider");
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+        assert_eq!(db.list_providers().expect("list providers").len(), 8);
+    }
+
+    #[test]
+    fn concurrent_database_open_serializes_migrations() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = std::sync::Arc::new(directory.path().join("metadata.db"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    MetadataDb::open(path.as_ref()).expect("concurrent database open")
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let db = handle.join().expect("open thread");
+            assert_eq!(
+                db.schema_version().expect("schema version"),
+                LATEST_SCHEMA_VERSION
+            );
+        }
     }
 }

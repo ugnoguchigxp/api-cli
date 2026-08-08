@@ -11,6 +11,7 @@ use rmcp::{RoleServer, ServerHandler, ServiceExt};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+mod redis_store;
 pub mod remote;
 
 #[derive(Clone)]
@@ -242,6 +243,7 @@ fn tool_error(error: CliError, remote: bool) -> CallToolResponse {
 fn error_type(error: &CliError) -> &'static str {
     match error {
         CliError::ActionNotFound(_) => "action_not_found",
+        CliError::InvalidInput(_) => "invalid_input",
         CliError::SchemaValidation { .. } => "schema_validation",
         CliError::AuthorizationDenied(_) => "authorization_denied",
         CliError::ApprovalRequired { .. } => "approval_required",
@@ -249,6 +251,7 @@ fn error_type(error: &CliError) -> &'static str {
         CliError::AuthRequired | CliError::AuthExpired => "authentication",
         CliError::RequestTimeout { .. } => "timeout",
         CliError::ResponseTooLarge { .. } => "response_too_large",
+        CliError::RequestTooLarge { .. } => "request_too_large",
         CliError::UpstreamError { .. } => "upstream_error",
         CliError::UpstreamResultUnknown => "upstream_result_unknown",
         CliError::BlockedUrl(_) => "blocked_url",

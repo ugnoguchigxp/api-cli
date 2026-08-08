@@ -5,6 +5,9 @@ export type ApiCliErrorCode =
   | "INVALID_RESPONSE"
   | "BAD_REQUEST"
   | "METHOD_NOT_ALLOWED"
+  | "BLOCKED_URL"
+  | "REQUEST_TOO_LARGE"
+  | "RESPONSE_TOO_LARGE"
   | "HTTP_ERROR";
 
 export class ApiCliError extends Error {

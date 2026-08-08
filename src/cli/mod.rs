@@ -16,7 +16,7 @@ pub struct Cli {
     pub pretty: bool,
 
     /// Verbose logging
-    #[arg(short, long, global = true)]
+    #[arg(short, long, global = true, conflicts_with = "json")]
     pub verbose: bool,
 }
 
@@ -52,6 +52,26 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: OpenapiCommands,
     },
+    /// Inspect secret-free local audit events
+    Audit {
+        #[command(subcommand)]
+        cmd: AuditCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuditCommands {
+    /// List recent audit events
+    List {
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+        #[arg(long)]
+        action: Option<String>,
+        #[arg(long)]
+        outcome: Option<String>,
+    },
+    /// Show one audit event
+    Show { event_id: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -87,6 +107,21 @@ pub struct ServeHttpArgs {
     /// Maximum size of one Remote MCP HTTP request body
     #[arg(long, default_value_t = 1_048_576)]
     pub max_request_bytes: usize,
+    /// Sustained request rate allowed for each authenticated subject
+    #[arg(long, default_value_t = 120)]
+    pub requests_per_minute: u32,
+    /// Maximum per-subject request burst
+    #[arg(long, default_value_t = 30)]
+    pub rate_limit_burst: u32,
+    /// Environment variable holding a Redis URL for cross-instance session state
+    #[arg(long)]
+    pub redis_url_env: Option<String>,
+    /// Redis key prefix used by this broker deployment
+    #[arg(long, default_value = "api-cli:mcp")]
+    pub redis_key_prefix: String,
+    /// Redis-backed session and identity-binding lifetime
+    #[arg(long, default_value_t = 600)]
+    pub session_ttl_seconds: u64,
     /// Permit cleartext HTTP on a non-loopback listener (normally use a loopback TLS proxy)
     #[arg(long)]
     pub allow_insecure_http: bool,
@@ -157,7 +192,7 @@ pub enum ProviderCommands {
         /// Fixed loopback port for OAuth providers that do not allow dynamic ports
         #[arg(long)]
         oauth_redirect_port: Option<u16>,
-        /// Permit this provider to resolve to private or loopback addresses
+        /// Permit this provider to resolve to private or loopback addresses; HTTP still requires a literal loopback IP
         #[arg(long)]
         allow_private_network: bool,
     },
@@ -171,11 +206,22 @@ pub enum ProviderCommands {
 pub enum AuthCommands {
     Login {
         provider_id: String,
+        /// Read an API key from standard input instead of prompting
         #[arg(long)]
-        api_key: Option<String>,
+        api_key_stdin: bool,
+        /// Provision the credential for this Remote MCP principal
+        #[arg(long, requires = "tenant_id")]
+        principal_id: Option<String>,
+        /// Provision the credential for this Remote MCP tenant
+        #[arg(long, requires = "principal_id")]
+        tenant_id: Option<String>,
     },
     Status {
         provider_id: String,
+        #[arg(long, requires = "tenant_id")]
+        principal_id: Option<String>,
+        #[arg(long, requires = "principal_id")]
+        tenant_id: Option<String>,
     },
 }
 
@@ -257,7 +303,6 @@ mod tests {
             "api-cli",
             "--json",
             "--pretty",
-            "--verbose",
             "api",
             "call",
             "provider-1",
@@ -270,7 +315,7 @@ mod tests {
 
         assert!(cli.json);
         assert!(cli.pretty);
-        assert!(cli.verbose);
+        assert!(!cli.verbose);
 
         match cli.command {
             Commands::Api {
@@ -300,6 +345,13 @@ mod tests {
     }
 
     #[test]
+    fn json_and_verbose_are_mutually_exclusive() {
+        let error = Cli::try_parse_from(["api-cli", "--json", "--verbose", "provider", "list"])
+            .expect_err("JSON output must not be polluted by tracing");
+        assert!(error.to_string().contains("--verbose"));
+    }
+
+    #[test]
     fn parses_mcp_serve_command() {
         let cli = Cli::try_parse_from(["api-cli", "mcp", "serve"]).expect("parse mcp serve");
         assert!(!cli.json);
@@ -310,6 +362,37 @@ mod tests {
             Commands::Mcp {
                 cmd: McpCommands::Serve,
             } => {}
+            _ => panic!("unexpected command variant"),
+        }
+    }
+
+    #[test]
+    fn parses_filtered_audit_list() {
+        let cli = Cli::try_parse_from([
+            "api-cli",
+            "audit",
+            "list",
+            "--limit",
+            "25",
+            "--action",
+            "customer.get",
+            "--outcome",
+            "succeeded",
+        ])
+        .expect("parse audit list");
+        match cli.command {
+            Commands::Audit {
+                cmd:
+                    AuditCommands::List {
+                        limit,
+                        action,
+                        outcome,
+                    },
+            } => {
+                assert_eq!(limit, 25);
+                assert_eq!(action.as_deref(), Some("customer.get"));
+                assert_eq!(outcome.as_deref(), Some("succeeded"));
+            }
             _ => panic!("unexpected command variant"),
         }
     }

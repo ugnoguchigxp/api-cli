@@ -197,13 +197,22 @@ impl ActionRegistry {
                 action.spec.executor.kind
             )));
         }
-        if action.spec.executor.path.contains(['?', '#'])
+        if action.spec.executor.path.len() > 8 * 1024
+            || action.spec.executor.path.contains(['?', '#'])
+            || action.spec.executor.path.contains('\\')
+            || action
+                .spec
+                .executor
+                .path
+                .split('/')
+                .any(|segment| matches!(segment, "." | ".."))
             || action.spec.executor.path.chars().any(char::is_control)
         {
             return Err(CliError::InvalidAction(format!(
-                "{name}: executor path cannot contain a query, fragment, or control character"
+                "{name}: executor path cannot contain traversal, a query, fragment, or control character"
             )));
         }
+        validate_executor_path_segments(&action.spec.executor.path, name)?;
         let method = action.spec.executor.method.to_ascii_uppercase();
         if !matches!(method.as_str(), "GET" | "POST" | "PUT" | "PATCH" | "DELETE") {
             return Err(CliError::InvalidAction(format!(
@@ -304,6 +313,11 @@ impl ActionRegistry {
                     "{name}: {location:?} parameter {parameter} must have an explicit scalar schema type"
                 )));
             }
+            if method == "GET" && *location == ParameterLocation::Body {
+                return Err(CliError::InvalidAction(format!(
+                    "{name}: GET parameter {parameter} cannot be mapped to the request body"
+                )));
+            }
         }
         if method == "GET" {
             for (parameter, schema) in input_properties {
@@ -328,10 +342,19 @@ impl ActionRegistry {
             })?;
             validate_schema_references(schema, schema, 0, name)?;
         }
+        let mut response_masks = BTreeSet::new();
+        if action.spec.constraints.response_mask.len() > 256 {
+            return Err(CliError::InvalidAction(format!(
+                "{name}: response_mask cannot contain more than 256 pointers"
+            )));
+        }
         for pointer in &action.spec.constraints.response_mask {
-            if !is_valid_json_pointer(pointer) {
+            if pointer.len() > 2048
+                || !is_valid_json_pointer(pointer)
+                || !response_masks.insert(pointer)
+            {
                 return Err(CliError::InvalidAction(format!(
-                    "{name}: response mask must be a JSON Pointer: {pointer}"
+                    "{name}: response mask must be a unique JSON Pointer no longer than 2048 bytes: {pointer}"
                 )));
             }
         }
@@ -429,16 +452,62 @@ pub(crate) fn is_forbidden_request_header(header: &reqwest::header::HeaderName) 
         header.as_str(),
         "authorization"
             | "proxy-authorization"
+            | "proxy-authenticate"
+            | "proxy-connection"
             | "host"
             | "cookie"
             | "connection"
             | "content-length"
             | "expect"
+            | "keep-alive"
             | "te"
             | "trailer"
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn validate_executor_path_segments(path: &str, action_name: &str) -> Result<()> {
+    for segment in path.split('/') {
+        let bytes = segment.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut index = 0;
+        while index < bytes.len() {
+            if bytes[index] != b'%' {
+                decoded.push(bytes[index]);
+                index += 1;
+                continue;
+            }
+            if index + 2 >= bytes.len() {
+                return Err(CliError::InvalidAction(format!(
+                    "{action_name}: executor path contains invalid percent encoding"
+                )));
+            }
+            let Some(high) = (bytes[index + 1] as char).to_digit(16) else {
+                return Err(CliError::InvalidAction(format!(
+                    "{action_name}: executor path contains invalid percent encoding"
+                )));
+            };
+            let Some(low) = (bytes[index + 2] as char).to_digit(16) else {
+                return Err(CliError::InvalidAction(format!(
+                    "{action_name}: executor path contains invalid percent encoding"
+                )));
+            };
+            decoded.push(((high << 4) | low) as u8);
+            index += 3;
+        }
+        if decoded == b"."
+            || decoded == b".."
+            || decoded.contains(&b'/')
+            || decoded.contains(&b'\\')
+            || decoded.iter().any(|byte| byte.is_ascii_control())
+        {
+            return Err(CliError::InvalidAction(format!(
+                "{action_name}: executor path contains an encoded traversal or control character"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn extract_path_parameters(path: &str, action_name: &str) -> Result<BTreeSet<String>> {
@@ -711,6 +780,9 @@ impl ActionApp {
             .registry
             .get(name)
             .ok_or_else(|| CliError::ActionNotFound(name.into()))?;
+        if action.spec.risk.is_read_only() && approval_ticket.is_some() {
+            return Err(CliError::InvalidApproval);
+        }
         validate_instance(&action.spec.input_schema, &input, "input")?;
         authorize(identity, action)?;
         if !self.is_available(identity, action)? {
@@ -927,6 +999,7 @@ fn error_code(error: &CliError) -> &'static str {
     match error {
         CliError::RequestTimeout { .. } => "timeout",
         CliError::ResponseTooLarge { .. } => "response_too_large",
+        CliError::RequestTooLarge { .. } => "request_too_large",
         CliError::UpstreamError { .. } => "upstream",
         CliError::UpstreamResultUnknown => "upstream_unknown",
         CliError::BlockedUrl(_) => "blocked_url",
@@ -1262,6 +1335,14 @@ mod tests {
         malformed_mask.spec.constraints.response_mask = vec!["/customer/~2secret".into()];
         assert!(ActionRegistry::from_actions(vec![malformed_mask]).is_err());
 
+        let mut duplicate_mask = action("GET", RiskLevel::Read, ApprovalMode::Never);
+        duplicate_mask.spec.constraints.response_mask = vec!["/secret".into(), "/secret".into()];
+        assert!(ActionRegistry::from_actions(vec![duplicate_mask]).is_err());
+
+        let mut encoded_traversal = action("GET", RiskLevel::Read, ApprovalMode::Never);
+        encoded_traversal.spec.executor.path = "/customers/%2e%2e/{customer_id}".into();
+        assert!(ActionRegistry::from_actions(vec![encoded_traversal]).is_err());
+
         let policy = action("PATCH", RiskLevel::ReversibleWrite, ApprovalMode::Policy);
         assert!(ActionRegistry::from_actions(vec![policy]).is_err());
 
@@ -1269,6 +1350,19 @@ mod tests {
         excessive_scopes.spec.broker_scopes =
             (0..257).map(|index| format!("scope:{index}")).collect();
         assert!(ActionRegistry::from_actions(vec![excessive_scopes]).is_err());
+
+        let mut get_with_body = action("GET", RiskLevel::Read, ApprovalMode::Never);
+        get_with_body
+            .spec
+            .executor
+            .parameters
+            .insert("customer_id".into(), ParameterLocation::Body);
+        get_with_body.spec.executor.path = "/customers".into();
+        assert!(ActionRegistry::from_actions(vec![get_with_body]).is_err());
+
+        let mut hop_header = action("PATCH", RiskLevel::ReversibleWrite, ApprovalMode::Always);
+        hop_header.spec.constraints.idempotency_header = Some("keep-alive".into());
+        assert!(ActionRegistry::from_actions(vec![hop_header]).is_err());
     }
 
     #[test]

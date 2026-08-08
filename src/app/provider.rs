@@ -34,8 +34,15 @@ impl ProviderApp {
     }
 
     pub fn remove_provider(&self, id: &str) -> Result<()> {
+        let mut first_error = None;
         for secret_id in self.db.delete_provider(id)? {
-            self.vault_db.delete_secret(&secret_id)?;
+            if let Err(error) = self.vault_db.delete_secret(&secret_id) {
+                tracing::warn!(secret_id, %error, "Failed to delete a revoked provider credential");
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(())
     }
@@ -62,10 +69,11 @@ fn validate_provider(config: &ProviderConfig) -> Result<()> {
         ));
     }
     if let CredentialPlacement::Header { name } = &config.credential_placement {
-        let header = reqwest::header::HeaderName::from_bytes(name.as_bytes())
-            .map_err(|error| CliError::Internal(format!("invalid API key header: {error}")))?;
+        let header = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+            CliError::InvalidProvider(format!("invalid API key header: {error}"))
+        })?;
         if crate::app::action::is_forbidden_request_header(&header) {
-            return Err(CliError::Internal(format!(
+            return Err(CliError::InvalidProvider(format!(
                 "sensitive API key header is forbidden: {name}"
             )));
         }
@@ -75,7 +83,7 @@ fn validate_provider(config: &ProviderConfig) -> Result<()> {
             || config.auth_url.as_deref().unwrap_or_default().is_empty()
             || config.token_url.as_deref().unwrap_or_default().is_empty())
     {
-        return Err(CliError::Internal(
+        return Err(CliError::InvalidProvider(
             "OAuth PKCE provider requires client-id, auth-url, and token-url".into(),
         ));
     }
@@ -91,6 +99,16 @@ fn validate_provider(config: &ProviderConfig) -> Result<()> {
                 "OAuth authorization",
                 config.allow_private_network,
             )?;
+            let client_id = config.client_id.as_deref().unwrap_or_default();
+            if client_id.len() > 256
+                || client_id.trim() != client_id
+                || client_id.chars().any(char::is_control)
+            {
+                return Err(CliError::InvalidProvider(
+                    "OAuth client_id must be 1..=256 bytes without surrounding whitespace or control characters"
+                        .into(),
+                ));
+            }
             validate_configured_url(
                 config.token_url.as_deref().unwrap_or_default(),
                 "OAuth token",
@@ -140,6 +158,11 @@ fn validate_configured_url(
     label: &str,
     allow_private_network: bool,
 ) -> Result<url::Url> {
+    if value.len() > 16 * 1024 {
+        return Err(CliError::BlockedUrl(format!(
+            "{label} URL exceeds 16384 bytes"
+        )));
+    }
     let parsed = url::Url::parse(value)
         .map_err(|error| CliError::BlockedUrl(format!("invalid {label} URL: {error}")))?;
     if parsed.host_str().is_none()
@@ -152,10 +175,8 @@ fn validate_configured_url(
         )));
     }
     let loopback = parsed.host_str().is_some_and(|host| {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|address| address.is_loopback())
+        host.parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
     });
     if parsed.scheme() != "https"
         && !(parsed.scheme() == "http" && loopback && allow_private_network)
@@ -234,6 +255,20 @@ mod tests {
                 .base_url,
             "https://example.com"
         );
+    }
+
+    #[test]
+    fn cleartext_provider_requires_a_literal_loopback_address() {
+        let mut provider = sample_provider("p1");
+        provider.base_url = "http://localhost:8080".into();
+        provider.allow_private_network = true;
+        assert!(matches!(
+            validate_provider(&provider),
+            Err(CliError::BlockedUrl(_))
+        ));
+
+        provider.base_url = "http://127.0.0.1:8080".into();
+        validate_provider(&provider).expect("literal loopback development provider");
     }
 
     #[test]

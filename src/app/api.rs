@@ -12,8 +12,15 @@ use std::time::Duration;
 
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const DEFAULT_MAX_REQUEST_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_MAX_ERROR_BYTES: usize = 64 * 1024;
+const MAX_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+const MAX_REQUEST_URL_LENGTH: usize = 16 * 1024;
+const MAX_EXECUTOR_HEADERS: usize = 128;
+const MAX_HEADER_NAME_LENGTH: usize = 256;
+const MAX_HEADER_VALUE_LENGTH: usize = 8 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ApiRequestOptions {
@@ -145,6 +152,59 @@ impl ApiApp {
         body: Option<serde_json::Value>,
         options: ApiRequestOptions,
     ) -> Result<serde_json::Value> {
+        if options.timeout < Duration::from_millis(1) || options.timeout > MAX_REQUEST_TIMEOUT {
+            return Err(CliError::InvalidInput(
+                "request timeout must be between 1 ms and 300 seconds".into(),
+            ));
+        }
+        if options.max_response_bytes == 0 || options.max_response_bytes > MAX_RESPONSE_BYTES {
+            return Err(CliError::InvalidInput(format!(
+                "max_response_bytes must be between 1 and {MAX_RESPONSE_BYTES}"
+            )));
+        }
+        let req_method = match method.to_ascii_uppercase().as_str() {
+            "GET" => Method::GET,
+            "POST" => Method::POST,
+            "PUT" => Method::PUT,
+            "DELETE" => Method::DELETE,
+            "PATCH" => Method::PATCH,
+            _ => {
+                return Err(CliError::InvalidInput(format!(
+                    "unsupported HTTP method {method}"
+                )))
+            }
+        };
+        if req_method == Method::GET && body.is_some() {
+            return Err(CliError::InvalidInput(
+                "GET requests cannot include a body".into(),
+            ));
+        }
+        validate_request_identity(provider_id, &options.principal_id, &options.tenant_id)?;
+        if options.headers.len() > MAX_EXECUTOR_HEADERS
+            || options.headers.iter().any(|(name, value)| {
+                name.len() > MAX_HEADER_NAME_LENGTH || value.len() > MAX_HEADER_VALUE_LENGTH
+            })
+        {
+            return Err(CliError::InvalidInput(format!(
+                "executor headers must contain at most {MAX_EXECUTOR_HEADERS} entries with names up to {MAX_HEADER_NAME_LENGTH} bytes and values up to {MAX_HEADER_VALUE_LENGTH} bytes"
+            )));
+        }
+        let serialized_body =
+            body.as_ref()
+                .map(serde_json::to_vec)
+                .transpose()
+                .map_err(|error| {
+                    CliError::InvalidInput(format!("request body cannot be serialized: {error}"))
+                })?;
+        if serialized_body
+            .as_ref()
+            .is_some_and(|body| body.len() > DEFAULT_MAX_REQUEST_BYTES)
+        {
+            return Err(CliError::RequestTooLarge {
+                limit_bytes: DEFAULT_MAX_REQUEST_BYTES,
+            });
+        }
+
         let provider = self
             .metadata_db
             .get_provider(provider_id)?
@@ -221,11 +281,6 @@ impl ApiApp {
             return Err(CliError::VaultError("Stored credential is empty".into()));
         }
 
-        let url_text = if path.starts_with('/') {
-            format!("{}{}", provider.base_url.trim_end_matches('/'), path)
-        } else {
-            format!("{}/{}", provider.base_url.trim_end_matches('/'), path)
-        };
         let base_url = url::Url::parse(&provider.base_url)
             .map_err(|error| CliError::BlockedUrl(format!("invalid provider base URL: {error}")))?;
         if base_url.query().is_some() || base_url.fragment().is_some() {
@@ -234,23 +289,18 @@ impl ApiApp {
             ));
         }
         validate_outbound_url(&base_url, provider.allow_private_network).await?;
-        let url = url::Url::parse(&url_text)
-            .map_err(|error| CliError::BlockedUrl(format!("invalid request URL: {error}")))?;
+        let url = build_provider_url(&base_url, path)?;
+        if url.as_str().len() > MAX_REQUEST_URL_LENGTH {
+            return Err(CliError::BlockedUrl(format!(
+                "request URL exceeds {MAX_REQUEST_URL_LENGTH} bytes"
+            )));
+        }
         validate_outbound_url(&url, provider.allow_private_network).await?;
         if !same_origin(&base_url, &url) {
             return Err(CliError::BlockedUrl(
                 "request path changed the provider origin".into(),
             ));
         }
-
-        let req_method = match method.to_uppercase().as_str() {
-            "GET" => Method::GET,
-            "POST" => Method::POST,
-            "PUT" => Method::PUT,
-            "DELETE" => Method::DELETE,
-            "PATCH" => Method::PATCH,
-            _ => return Err(CliError::Internal(format!("Unsupported method {}", method))),
-        };
 
         let client = if provider.allow_private_network {
             &self.private_client
@@ -284,6 +334,10 @@ impl ApiApp {
                 req.header(header_name, value)
             }
         };
+        let has_content_type = options
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case(reqwest::header::CONTENT_TYPE.as_str()));
         for (name, value) in options.headers {
             let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
                 CliError::InvalidAction(format!("invalid executor header name: {error}"))
@@ -308,8 +362,11 @@ impl ApiApp {
             req = req.header(header_name, header_value);
         }
 
-        if let Some(json_body) = body {
-            req = req.json(&json_body);
+        if let Some(json_body) = serialized_body {
+            if !has_content_type {
+                req = req.header(reqwest::header::CONTENT_TYPE, "application/json");
+            }
+            req = req.body(json_body);
         }
 
         let res = req.send().await.map_err(|error| {
@@ -351,22 +408,80 @@ impl ApiApp {
     }
 }
 
+fn decode_path_segment(segment: &str) -> Result<Vec<u8>> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(CliError::BlockedUrl(
+                    "request path contains invalid percent encoding".into(),
+                ));
+            }
+            let high = (bytes[index + 1] as char).to_digit(16);
+            let low = (bytes[index + 2] as char).to_digit(16);
+            let (Some(high), Some(low)) = (high, low) else {
+                return Err(CliError::BlockedUrl(
+                    "request path contains invalid percent encoding".into(),
+                ));
+            };
+            decoded.push(((high << 4) | low) as u8);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    Ok(decoded)
+}
+
+fn build_provider_url(base_url: &url::Url, path: &str) -> Result<url::Url> {
+    if path.contains(['\\', '#']) || path.chars().any(char::is_control) {
+        return Err(CliError::BlockedUrl(
+            "request path contains forbidden characters".into(),
+        ));
+    }
+    let (path_only, query) = path
+        .split_once('?')
+        .map_or((path, None), |(path, query)| (path, Some(query)));
+    for segment in path_only.split('/') {
+        let decoded = decode_path_segment(segment)?;
+        if decoded == b"."
+            || decoded == b".."
+            || decoded.contains(&b'/')
+            || decoded.contains(&b'\\')
+            || decoded.iter().any(|byte| byte.is_ascii_control())
+        {
+            return Err(CliError::BlockedUrl(
+                "request path contains a traversal segment".into(),
+            ));
+        }
+    }
+
+    let mut normalized_base = base_url.clone();
+    let base_prefix = if normalized_base.path().ends_with('/') {
+        normalized_base.path().to_string()
+    } else {
+        format!("{}/", normalized_base.path())
+    };
+    normalized_base.set_path(&base_prefix);
+    let mut request_url = normalized_base
+        .join(path_only.trim_start_matches('/'))
+        .map_err(|error| CliError::BlockedUrl(format!("invalid request path: {error}")))?;
+    if !same_origin(base_url, &request_url) || !request_url.path().starts_with(&base_prefix) {
+        return Err(CliError::BlockedUrl(
+            "request path escaped the provider base URL".into(),
+        ));
+    }
+    request_url.set_query(query);
+    Ok(request_url)
+}
+
 fn build_api_client(allow_private_network: bool) -> Result<Client> {
     let builder = configure_dns(Client::builder(), allow_private_network)
         .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            if attempt.previous().len() >= 3 {
-                return attempt.error("redirect limit exceeded");
-            }
-            let Some(first) = attempt.previous().first() else {
-                return attempt.follow();
-            };
-            if same_origin(first, attempt.url()) {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }));
+        .redirect(reqwest::redirect::Policy::none());
     builder
         .build()
         .map_err(|error| CliError::Internal(format!("Failed to create HTTP client: {error}")))
@@ -440,6 +555,25 @@ fn same_origin(left: &url::Url, right: &url::Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
+fn validate_request_identity(provider_id: &str, principal_id: &str, tenant_id: &str) -> Result<()> {
+    for (name, value) in [
+        ("provider_id", provider_id),
+        ("principal_id", principal_id),
+        ("tenant_id", tenant_id),
+    ] {
+        if value.is_empty()
+            || value.len() > 256
+            || value.trim() != value
+            || value.chars().any(char::is_control)
+        {
+            return Err(CliError::InvalidInput(format!(
+                "{name} must be 1..=256 bytes without surrounding whitespace or control characters"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub(crate) async fn validate_outbound_url(
     url: &url::Url,
     allow_private_network: bool,
@@ -447,11 +581,10 @@ pub(crate) async fn validate_outbound_url(
     let host = url
         .host_str()
         .ok_or_else(|| CliError::BlockedUrl("URL does not contain a host".into()))?;
-    let is_loopback = host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .map(|address| address.is_loopback())
-            .unwrap_or(false);
+    let is_loopback = host
+        .parse::<IpAddr>()
+        .map(|address| address.is_loopback())
+        .unwrap_or(false);
 
     if url.scheme() != "https" && !(url.scheme() == "http" && is_loopback) {
         return Err(CliError::BlockedUrl(format!(
@@ -537,7 +670,7 @@ fn is_non_public_ip(address: IpAddr) -> bool {
                 || (segments[0] == 0x2001 && segments[1] == 0x0db8)
                 || (segments[0] & 0xffc0) == 0xfec0
                 || segments[0] == 0x2002
-                || (segments[0] & 0xfff0) == 0x3ff0
+                || (segments[0] == 0x3fff && (segments[1] & 0xf000) == 0)
                 || segments[0] == 0x5f00
         }
     }
@@ -663,7 +796,78 @@ mod tests {
             .call("p1", "TRACE", "/v1/data", None)
             .await
             .expect_err("unsupported method should fail");
-        assert!(matches!(err, CliError::Internal(_)));
+        assert!(matches!(err, CliError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn request_options_and_get_bodies_are_validated_before_io() {
+        let (metadata, vault, crypto) = setup();
+        let auth = AuthApp::new(&metadata, &vault, &crypto);
+        let app = ApiApp::new(&metadata, &vault, &crypto, &auth);
+
+        assert!(matches!(
+            app.call_with_limits(
+                "missing",
+                "GET",
+                "/",
+                None,
+                std::time::Duration::ZERO,
+                DEFAULT_MAX_RESPONSE_BYTES,
+            )
+            .await,
+            Err(CliError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            app.call_with_limits(
+                "missing",
+                "GET",
+                "/",
+                None,
+                std::time::Duration::from_nanos(1),
+                DEFAULT_MAX_RESPONSE_BYTES,
+            )
+            .await,
+            Err(CliError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            app.call(
+                "missing",
+                "POST",
+                "/",
+                Some(serde_json::Value::String(
+                    "x".repeat(DEFAULT_MAX_REQUEST_BYTES + 1)
+                )),
+            )
+            .await,
+            Err(CliError::RequestTooLarge { .. })
+        ));
+        let too_many_headers = (0..=MAX_EXECUTOR_HEADERS)
+            .map(|index| (format!("x-header-{index}"), "value".into()))
+            .collect();
+        assert!(matches!(
+            app.call_with_options(
+                "missing",
+                "GET",
+                "/",
+                None,
+                ApiRequestOptions {
+                    headers: too_many_headers,
+                    ..ApiRequestOptions::default()
+                },
+            )
+            .await,
+            Err(CliError::InvalidInput(_))
+        ));
+        assert!(matches!(
+            app.call(
+                "missing",
+                "GET",
+                "/",
+                Some(serde_json::json!({"unexpected": true})),
+            )
+            .await,
+            Err(CliError::InvalidInput(_))
+        ));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -952,6 +1156,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_origin_redirect_cannot_escape_provider_base_path() {
+        use axum::{response::Redirect, routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let admin_hits = Arc::new(AtomicUsize::new(0));
+        let hits = admin_hits.clone();
+        let router = Router::new()
+            .route(
+                "/allowed/redirect",
+                get(|| async { Redirect::temporary("/admin") }),
+            )
+            .route(
+                "/admin",
+                get(move || {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        "admin"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("address");
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+
+        let (metadata, vault, crypto) = setup();
+        metadata
+            .insert_provider(&api_key_provider(
+                "p1",
+                &format!("http://{address}/allowed"),
+            ))
+            .expect("provider");
+        insert_session_with_secret(&metadata, &vault, &crypto, "p1", "sec1", b"key", None);
+        let auth = AuthApp::new(&metadata, &vault, &crypto);
+        let app = ApiApp::new(&metadata, &vault, &crypto, &auth);
+        assert!(matches!(
+            app.call("p1", "GET", "/redirect", None).await,
+            Err(CliError::UpstreamError { status: 307 })
+        ));
+        assert_eq!(admin_hits.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn private_network_requires_explicit_provider_permission() {
         let (metadata, vault, crypto) = setup();
         let mut provider = api_key_provider("p1", "http://127.0.0.1:9");
@@ -967,6 +1222,14 @@ mod tests {
             .await
             .expect_err("private egress must be blocked");
         assert!(matches!(error, CliError::BlockedUrl(_)));
+        assert!(matches!(
+            validate_outbound_url(
+                &url::Url::parse("http://localhost:8080").expect("URL"),
+                true
+            )
+            .await,
+            Err(CliError::BlockedUrl(_))
+        ));
     }
 
     #[test]
@@ -994,6 +1257,46 @@ mod tests {
         assert!(!is_non_public_ip(
             "2606:4700:4700::1111".parse().expect("public IPv6")
         ));
+        assert!(is_non_public_ip(
+            "3fff::1".parse().expect("documentation IPv6")
+        ));
+        assert!(!is_non_public_ip(
+            "3ff0::1".parse().expect("outside documentation range")
+        ));
+        assert!(!is_non_public_ip(
+            "3fff:1000::1"
+                .parse()
+                .expect("outside documentation prefix")
+        ));
+    }
+
+    #[test]
+    fn provider_base_path_cannot_be_escaped() {
+        let base = url::Url::parse("https://api.example.com/allowed").expect("base URL");
+        assert_eq!(
+            build_provider_url(&base, "/v1/items")
+                .expect("safe path")
+                .as_str(),
+            "https://api.example.com/allowed/v1/items"
+        );
+        assert_eq!(
+            build_provider_url(&base, "/v1/items?expand=true&tag=a%2Fb")
+                .expect("safe query")
+                .as_str(),
+            "https://api.example.com/allowed/v1/items?expand=true&tag=a%2Fb"
+        );
+        for path in [
+            "/../admin",
+            "/%2e%2e/admin",
+            "/safe%2fadmin",
+            "/safe\\admin",
+            "/safe/%00",
+        ] {
+            assert!(matches!(
+                build_provider_url(&base, path),
+                Err(CliError::BlockedUrl(_))
+            ));
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

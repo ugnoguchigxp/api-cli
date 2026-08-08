@@ -15,7 +15,7 @@ export function createStaticProviderResolver(
   options: StaticProviderResolverOptions = {},
 ): ProviderResolver {
   return async (providerId, context) => {
-    const provider = providers[providerId];
+    const provider = Object.hasOwn(providers, providerId) ? providers[providerId] : undefined;
     if (!provider) {
       if (options.onNotFound) {
         await options.onNotFound(providerId, context);

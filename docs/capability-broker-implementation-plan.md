@@ -19,14 +19,14 @@ ActionDefinition
 
 - 対象ブランチ: `main`
 - ベースラインコミット: `db3a6ee8477066f394ce457e79067637d45786b8`
-- 実装バージョン: `0.2.0`
+- 実装バージョン: `0.3.0`
 - 計画対象: `0.1.x`から`0.4`まで
 - 計画更新条件:
   - MCP仕様または`rmcp`の互換性方針が変わった場合
   - ActionDefinitionの公開形式を変更する場合
   - Remote MCPの認証方式を変更する場合
 
-### 2.1 2026-07-29 実装状況
+### 2.1 2026-08-08 実装状況
 
 今回の実装で完了:
 
@@ -45,13 +45,18 @@ ActionDefinition
 - OAuth introspection保護Streamable HTTP、audience/subject/tenant/client/scope検証
 - scope別Tool一覧、credentialとMCP sessionのprincipal/tenant分離
 - Origin/Host/CORS、同時実行数、session数、HTTP request bodyサイズ制限
+- 主体別token bucket rate limitと`Retry-After`
+- Redisによるcross-instance session復元、主体binding、rate limit共有
+- 監査イベントのfilter/list/show CLI
+- OS credential store優先のVault master key（安全なfile fallback付き）
+- WAL SQLite connection poolと並行writer検証
 
 安全のため未公開・継続対象:
 
 - Remote writeはBroker自身の認証済み承認ページを実装するまでTool一覧から除外する。
-- Remote principal用の外部OAuth URL elicitationとcredential接続作成UIは未実装。
-- Vault master keyのOS Keychain/Credential Manager/Secret ServiceまたはKMS wrappingは未実装。
-- 監査ログ閲覧API、外部approval UI、分散session store、運用rate limitは未実装。
+- Remote principal credentialは管理者CLIで事前プロビジョニング可能。セルフサービスUIは含めない。
+- 外部approval UIは未実装。Remote writeはその間fail-closedで公開しない。
+- KMS wrappingはdeployment固有のため組み込まない。ローカルはOS credential storeを優先する。
 
 ## 3. 到達点
 

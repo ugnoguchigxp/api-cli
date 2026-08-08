@@ -1,12 +1,16 @@
-export { ApiClient } from "./client";
-export { ApiCliError, ApiCliHttpError } from "./errors";
-export { createBearerAuthAdapter, createStaticProviderResolver } from "./adapters";
-export { createApiProxyServer } from "./proxy";
 export type {
   AccessTokenResolver,
   BearerAuthAdapterOptions,
   StaticProviderResolverOptions,
 } from "./adapters";
+export { createBearerAuthAdapter, createStaticProviderResolver } from "./adapters";
+export { ApiClient } from "./client";
+export {
+  createContextFromHeaders,
+  createContextFromNodeRequest,
+  createContextFromWebRequest,
+} from "./context";
+export { ApiCliError, ApiCliHttpError } from "./errors";
 export type {
   ApiProxyServer,
   ApiProxyServerConfig,
@@ -14,15 +18,13 @@ export type {
   NodeLikeRequest,
   NodeLikeResponse,
   ProxyAuthConfig,
+  SerializedResponse,
 } from "./proxy";
-export {
-  createContextFromHeaders,
-  createContextFromNodeRequest,
-  createContextFromWebRequest,
-} from "./context";
+export { createApiProxyServer } from "./proxy";
 export type {
   ApiCallRequest,
   ApiCallResponse,
+  ApiClientLimits,
   ApiClientOptions,
   AuthAdapter,
   HeaderContextOptions,

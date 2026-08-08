@@ -11,7 +11,9 @@
 - `ApiClient`
   - リクエストの実行
   - タイムアウト処理
+  - 接続時DNS解決結果を含むprivate/special-purpose networkの拒否
   - レスポンスのパース（`auto`/`json`/`text`/`raw`）
+  - request/response/error body上限とバイナリ保持
   - エラーの正規化（`ApiCliError`, `ApiCliHttpError`）
 - `ProviderResolver`
   - リクエストやテナントごとの実行時プロバイダ解決

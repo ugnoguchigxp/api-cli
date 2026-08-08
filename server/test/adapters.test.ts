@@ -23,6 +23,14 @@ describe("adapter helpers", () => {
     expect(onNotFound).toHaveBeenCalledWith("missing", { tenantId: "t1" });
   });
 
+  it("does not resolve inherited object properties as providers", async () => {
+    const onNotFound = vi.fn();
+    const resolver = createStaticProviderResolver({}, { onNotFound });
+
+    await expect(resolver("toString")).resolves.toBeNull();
+    expect(onNotFound).toHaveBeenCalledWith("toString", undefined);
+  });
+
   it("createBearerAuthAdapter returns authorization header", async () => {
     const adapter = createBearerAuthAdapter(({ context }) => {
       return context?.metadata?.token as string | undefined;

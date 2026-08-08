@@ -1,8 +1,25 @@
 [package]
 name = "api-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.88"
+description = "Local-first capability broker that exposes allowlisted REST API actions over CLI and MCP"
+license = "MIT"
+repository = "https://github.com/ugnoguchigxp/api-cli"
+homepage = "https://github.com/ugnoguchigxp/api-cli"
+readme = "README.md"
+keywords = ["mcp", "api", "cli", "oauth", "security"]
+categories = ["command-line-utilities", "authentication"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/examples/**",
+    "/docs/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE",
+]
 
 [dependencies]
 # CLI / async
@@ -20,8 +37,14 @@ rmcp = { version = "3.0.0", default-features = false, features = ["client", "ser
 
 # DB / Crypto
 rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
 aes-gcm = "0.10"
 rand = "0.8"
+keyring = "4.1.5"
+redis = { version = "0.32.7", features = ["tokio-rustls-comp", "connection-manager"] }
+async-trait = "0.1"
+fs2 = "0.4"
 
 # Err / Logging
 thiserror = "1.0"

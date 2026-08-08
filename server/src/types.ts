@@ -17,6 +17,16 @@ export interface ProviderConfig {
   baseUrl: string;
   defaultHeaders?: Record<string, string>;
   timeoutMs?: number;
+  /** Permit cleartext HTTP for an explicitly allowed loopback provider. */
+  allowInsecureHttp?: boolean;
+  /** Permit an explicit localhost or private/special-purpose IP target. */
+  allowPrivateNetwork?: boolean;
+}
+
+export interface ApiClientLimits {
+  maxRequestBytes?: number;
+  maxResponseBytes?: number;
+  maxErrorBytes?: number;
 }
 
 export type ProviderResolver = (
@@ -41,6 +51,7 @@ export interface ApiClientOptions {
   authAdapter?: AuthAdapter;
   fetchImpl?: typeof fetch;
   defaultTimeoutMs?: number;
+  limits?: ApiClientLimits;
 }
 
 export interface ApiCallRequest {

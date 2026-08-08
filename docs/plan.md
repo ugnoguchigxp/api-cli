@@ -1,5 +1,11 @@
 # CLI設計書 v2（正式版）
 
+> [!WARNING]
+> この文書は初期設計の履歴です。現行の規範仕様は
+> [capability-broker-implementation-plan.md](capability-broker-implementation-plan.md)です。
+> 特に、現行MCPは汎用`api_call`やprovider一覧を公開せず、有効なActionDefinitionから生成した
+> Toolだけを公開します。
+
 ## 1. 概要
 
 本CLIは、複数のバックエンドAPIサーバーに対して安全に認証・通信を行うローカルツールである。
@@ -94,11 +100,9 @@ MCPサーバーは標準入出力（stdio）経由でJSON-RPCメッセージを�
 
 #### 公開ツール定義
 
-| ツール名 | 説明 | 主要パラメータ |
-|----------|------|----------------|
-| `api_call` | APIリクエストを実行 | `provider_id`, `method`, `path`, `body` |
-| `list_providers` | 登録済みprovider一覧を返す | なし |
-| `auth_status` | 認証状態を返す | `provider_id` |
+この初期案の固定Tool群は廃止された。現行実装はレビュー済みActionDefinitionの`metadata.name`、
+入力schema、出力schemaからToolを動的生成する。任意method/pathを受け取るToolやprovider管理Toolは
+公開しない。
 
 #### `runtime/mcp.sock`
 
@@ -290,9 +294,10 @@ struct SessionRecord {
 
 * API呼び出し時にaccess tokenの有効期限を確認
 * 期限切れ（または期限30秒前）の場合、自動的にrefresh tokenでリフレッシュ
-* リフレッシュ成功時: 新しいaccess token / refresh tokenをvaultに上書き保存
+* リフレッシュ成功時: 新しいaccess token / refresh tokenを新規vault recordへ保存し、metadataを
+  旧secret ID条件付きで差し替えた後に旧recordを削除
 * リフレッシュ失敗時（refresh token失効等）: `AUTH_EXPIRED` エラーを返し、再ログインを促す
-* 同時リフレッシュの排他制御: ミューテックスで単一実行を保証
+* 同時リフレッシュの排他制御: process内ミューテックスとmetadata compare-and-swapで競合を解決
 
 ### 10.2 API Key
 

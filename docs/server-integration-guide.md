@@ -23,8 +23,9 @@ Authorization: Bearer <api-key>
 ```
 
 > [!NOTE]
-> `api-cli` は常に `Authorization: Bearer <token>` 形式で送信します。  
-> Basic 認証やカスタムヘッダー（`X-API-Key` 等）には現在対応していません。
+> 既定は `Authorization: Bearer <token>` です。`provider add --api-key-header x-api-key`
+> を指定したproviderでは、API Keyをその専用headerへ送信できます。Basic認証とquery parameter
+> へのAPI Key埋め込みには対応していません。
 
 ---
 
@@ -118,7 +119,8 @@ HTTP 302 Location: http://127.0.0.1:<port>/callback?code=<auth_code>&state=<stat
 ### エラーレスポンス
 
 - HTTP ステータスコードで成功（`2xx`）/ 失敗（`4xx`, `5xx`）を区別してください。
-- `api-cli` はステータスコードとレスポンスボディをそのままユーザーに表示します。
+- `api-cli` はステータスコードを型付きエラーへ変換します。秘密や内部情報の漏えいを避けるため、
+  上流エラーボディをそのまま表示しません。
 
 ---
 

@@ -7,12 +7,17 @@ function getHeaderValue(headers: HeaderMap, headerName: string): string | undefi
     return headers.get(headerName) ?? undefined;
   }
 
-  const direct =
-    headers[headerName] ?? headers[headerName.toLowerCase()] ?? headers[headerName.toUpperCase()];
-  if (Array.isArray(direct)) {
-    return direct[0];
+  const normalized = headerName.toLowerCase();
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== normalized) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      return value[0];
+    }
+    return value;
   }
-  return direct;
+  return undefined;
 }
 
 export function createContextFromHeaders(
@@ -40,7 +45,15 @@ export function createContextFromHeaders(
 
   if (options.includeRawHeadersInMetadata) {
     context.metadata = {
-      headers: headers instanceof Headers ? Object.fromEntries(headers.entries()) : headers,
+      headers:
+        headers instanceof Headers
+          ? Object.fromEntries(headers.entries())
+          : Object.fromEntries(
+              Object.entries(headers).map(([name, value]) => [
+                name,
+                Array.isArray(value) ? [...value] : value,
+              ]),
+            ),
     };
   }
 

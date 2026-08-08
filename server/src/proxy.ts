@@ -3,110 +3,56 @@ import { ApiClient } from "./client";
 import { createContextFromNodeRequest, createContextFromWebRequest } from "./context";
 import { ApiCliError, ApiCliHttpError } from "./errors";
 import type {
+  ApiProxyServer,
+  ApiProxyServerConfig,
+  NodeLikeHeaders,
+  NodeLikeRequest,
+  NodeLikeResponse,
+  SerializedResponse,
+} from "./proxy-types";
+import type {
   ApiCallRequest,
   ApiCallResponse,
+  ApiClientLimits,
   AuthAdapter,
   HeaderContextOptions,
   HttpMethod,
-  ProviderConfig,
   ProviderResolver,
   QueryValue,
   RequestContext,
-  ResponseParseMode,
 } from "./types";
 
-const DEFAULT_ALLOWED_METHODS: HttpMethod[] = [
-  "GET",
-  "POST",
-  "PUT",
-  "DELETE",
-  "PATCH",
-  "HEAD",
-  "OPTIONS",
-];
+const DEFAULT_ALLOWED_METHODS: HttpMethod[] = ["GET", "HEAD"];
+const ALL_HTTP_METHODS: HttpMethod[] = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"];
+const DEFAULT_MAX_REQUEST_BYTES = 1024 * 1024;
 
-const DEFAULT_FORWARD_HEADERS = ["x-request-id", "x-tenant-id", "x-user-id"];
+const DEFAULT_FORWARD_HEADERS = ["content-type", "x-request-id", "x-tenant-id", "x-user-id"];
+const FORBIDDEN_TRANSPORT_HEADERS = new Set([
+  "connection",
+  "content-encoding",
+  "content-length",
+  "host",
+  "keep-alive",
+  "proxy-authenticate",
+  "proxy-authorization",
+  "proxy-connection",
+  "set-cookie",
+  "set-cookie2",
+  "te",
+  "trailer",
+  "transfer-encoding",
+  "upgrade",
+]);
 
-type NodeHeaderValue = string | string[] | undefined;
-
-export type NodeLikeHeaders = Record<string, NodeHeaderValue>;
-
-export interface NodeLikeRequest {
-  method?: string;
-  path?: string;
-  url?: string;
-  originalUrl?: string;
-  query?: Record<string, unknown>;
-  headers?: NodeLikeHeaders;
-  body?: unknown;
-}
-
-export interface NodeLikeResponse {
-  status?: (statusCode: number) => NodeLikeResponse;
-  json?: (body: unknown) => void;
-  send?: (body: unknown) => void;
-  end?: (body?: unknown) => void;
-  setHeader?: (name: string, value: string) => void;
-  statusCode?: number;
-}
-
-export type ProxyAuthConfig =
-  | {
-      mode?: "none";
-    }
-  | {
-      mode: "static-bearer";
-      token: string;
-      headerName?: string;
-      scheme?: string;
-    }
-  | {
-      mode: "forward-header";
-      sourceHeaderName?: string;
-      targetHeaderName?: string;
-      passthrough?: boolean;
-      scheme?: string;
-    };
-
-export interface ApiProxyServerConfig {
-  providers?: Record<string, ProviderConfig>;
-  providerResolver?: ProviderResolver;
-  authAdapter?: AuthAdapter;
-  auth?: ProxyAuthConfig;
-  fetchImpl?: typeof fetch;
-  defaultTimeoutMs?: number;
-  routePrefix?: string;
-  defaultProviderId?: string;
-  providerQueryParam?: string;
-  pathQueryParam?: string;
-  allowedMethods?: HttpMethod[];
-  forwardHeaders?: string[];
-  parseAs?: ResponseParseMode;
-  headerContext?: HeaderContextOptions;
-  contextResolver?: (
-    input:
-      | {
-          kind: "web";
-          request: Request;
-        }
-      | {
-          kind: "node";
-          request: NodeLikeRequest;
-        },
-  ) => RequestContext | undefined | Promise<RequestContext | undefined>;
-  allowTargetPath?: (input: {
-    providerId: string;
-    targetPath: string;
-    method: HttpMethod;
-    context?: RequestContext;
-  }) => boolean;
-}
-
-interface SerializedResponse {
-  status: number;
-  headers: Record<string, string>;
-  body: string;
-}
+export type {
+  ApiProxyServer,
+  ApiProxyServerConfig,
+  NodeLikeHeaders,
+  NodeLikeRequest,
+  NodeLikeResponse,
+  ProxyAuthConfig,
+  SerializedResponse,
+} from "./proxy-types";
 
 type QueryMultiMap = Record<string, string[]>;
 
@@ -124,6 +70,33 @@ function normalizeRoutePrefix(prefix: string | undefined): string {
   return normalized;
 }
 
+function isBodyForbiddenStatus(status: number): boolean {
+  return status === 204 || status === 205 || status === 304;
+}
+
+function webResponseBody(serialized: SerializedResponse, suppressBody = false): BodyInit | null {
+  if (suppressBody || isBodyForbiddenStatus(serialized.status)) {
+    return null;
+  }
+  if (typeof serialized.body === "string") {
+    return serialized.body;
+  }
+  return serialized.body.buffer.slice(
+    serialized.body.byteOffset,
+    serialized.body.byteOffset + serialized.body.byteLength,
+  ) as ArrayBuffer;
+}
+
+function filteredResponseHeaders(headers: Headers): Record<string, string> {
+  const filtered: Record<string, string> = {};
+  for (const [name, value] of headers.entries()) {
+    if (!FORBIDDEN_TRANSPORT_HEADERS.has(name.toLowerCase())) {
+      filtered[name] = value;
+    }
+  }
+  return filtered;
+}
+
 function stripRoutePrefix(pathname: string, routePrefix: string): string {
   const normalizedPath = pathname.startsWith("/") ? pathname : `/${pathname}`;
   if (routePrefix === "/") {
@@ -138,12 +111,11 @@ function stripRoutePrefix(pathname: string, routePrefix: string): string {
     return normalizedPath.slice(routePrefix.length);
   }
 
-  const middle = normalizedPath.indexOf(`${routePrefix}/`);
-  if (middle >= 0) {
-    return normalizedPath.slice(middle + routePrefix.length);
-  }
-
   return normalizedPath;
+}
+
+function isWithinRoutePrefix(pathname: string, routePrefix: string): boolean {
+  return routePrefix === "/" || pathname === routePrefix || pathname.startsWith(`${routePrefix}/`);
 }
 
 function getHeaderValue(
@@ -191,7 +163,7 @@ function toHttpMethod(method: string | undefined): HttpMethod | null {
   }
 
   const normalized = method.toUpperCase();
-  if (DEFAULT_ALLOWED_METHODS.includes(normalized as HttpMethod)) {
+  if (ALL_HTTP_METHODS.includes(normalized as HttpMethod)) {
     return normalized as HttpMethod;
   }
 
@@ -297,7 +269,7 @@ function mergeContext(base: RequestContext, extra: RequestContext | undefined): 
 
 function statusFromError(error: unknown): number {
   if (error instanceof ApiCliHttpError) {
-    return error.status;
+    return error.status >= 400 && error.status <= 599 ? error.status : 502;
   }
 
   if (error instanceof ApiCliError) {
@@ -305,9 +277,12 @@ function statusFromError(error: unknown): number {
       case "PROVIDER_NOT_FOUND":
         return 404;
       case "BAD_REQUEST":
+      case "BLOCKED_URL":
         return 400;
       case "METHOD_NOT_ALLOWED":
         return 405;
+      case "REQUEST_TOO_LARGE":
+        return 413;
       case "TIMEOUT":
         return 504;
       default:
@@ -318,21 +293,31 @@ function statusFromError(error: unknown): number {
   return 500;
 }
 
-function serializeErrorResponse(error: unknown): SerializedResponse {
+function serializeErrorResponse(
+  error: unknown,
+  exposeUpstreamErrorDetails = false,
+): SerializedResponse {
   const status = statusFromError(error);
 
   if (error instanceof ApiCliHttpError) {
+    const details = exposeUpstreamErrorDetails
+      ? {
+          ...(error.details ?? {}),
+          upstreamStatus: error.status,
+          upstreamBody: error.responseText,
+          upstreamHeaders: error.responseHeaders,
+        }
+      : {
+          providerId: error.details?.providerId,
+          method: error.details?.method,
+          upstreamStatus: error.status,
+        };
     const body = JSON.stringify({
       ok: false,
       error: {
         code: error.code,
         message: error.message,
-        details: {
-          ...(error.details ?? {}),
-          upstreamStatus: error.status,
-          upstreamBody: error.responseText,
-          upstreamHeaders: error.responseHeaders,
-        },
+        details,
       },
     });
 
@@ -351,7 +336,7 @@ function serializeErrorResponse(error: unknown): SerializedResponse {
       error: {
         code: error.code,
         message: error.message,
-        details: error.details ?? null,
+        details: exposeUpstreamErrorDetails ? (error.details ?? null) : null,
       },
     });
 
@@ -368,7 +353,10 @@ function serializeErrorResponse(error: unknown): SerializedResponse {
     ok: false,
     error: {
       code: "INTERNAL",
-      message: error instanceof Error ? error.message : "Unexpected error",
+      message:
+        exposeUpstreamErrorDetails && error instanceof Error
+          ? error.message
+          : "Unexpected internal error",
     },
   });
 
@@ -388,11 +376,11 @@ async function serializeSuccessResponse(
   const contentType = result.headers["content-type"] ?? result.headers["Content-Type"];
 
   if (result.data instanceof Response) {
-    const responseHeaders = Object.fromEntries(result.data.headers.entries());
+    const responseHeaders = filteredResponseHeaders(result.data.headers);
     return {
       status: result.data.status,
       headers: responseHeaders,
-      body: await result.data.text(),
+      body: new Uint8Array(await result.data.arrayBuffer()),
     };
   }
 
@@ -405,11 +393,18 @@ async function serializeSuccessResponse(
     };
   }
 
+  let body: string;
+  try {
+    const serialized = JSON.stringify(result.data);
+    body = serialized === undefined ? "null" : serialized;
+  } catch {
+    throw new ApiCliError("INVALID_RESPONSE", "Response data is not JSON serializable");
+  }
   headers["content-type"] = contentType ?? "application/json; charset=utf-8";
   return {
     status: result.status,
     headers,
-    body: JSON.stringify(result.data),
+    body,
   };
 }
 
@@ -440,25 +435,81 @@ function isBodylessMethod(method: HttpMethod): boolean {
   return method === "GET" || method === "HEAD";
 }
 
-async function parseWebBody(request: Request, method: HttpMethod): Promise<unknown | undefined> {
+async function readLimitedRequestBody(request: Request, limit: number): Promise<Uint8Array> {
+  const contentLength = request.headers.get("content-length");
+  if (contentLength !== null) {
+    const parsed = Number(contentLength);
+    if (Number.isFinite(parsed) && parsed > limit) {
+      throw new ApiCliError("REQUEST_TOO_LARGE", `Request exceeded ${limit} bytes`, { limit });
+    }
+  }
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.byteLength;
+      if (size > limit) {
+        try {
+          await reader.cancel();
+        } catch {
+          // Preserve the size-limit error if cancellation itself fails.
+        }
+        throw new ApiCliError("REQUEST_TOO_LARGE", `Request exceeded ${limit} bytes`, { limit });
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+function isJsonContentType(contentType: string): boolean {
+  const mediaType = contentType.split(";", 1)[0]?.trim() ?? "";
+  return mediaType === "application/json" || mediaType.endsWith("+json");
+}
+
+function isTextContentType(contentType: string): boolean {
+  const mediaType = contentType.split(";", 1)[0]?.trim() ?? "";
+  return mediaType.startsWith("text/") || mediaType === "application/x-www-form-urlencoded";
+}
+
+async function parseWebBody(
+  request: Request,
+  method: HttpMethod,
+  maxRequestBytes: number,
+): Promise<unknown | undefined> {
   if (isBodylessMethod(method)) {
     return undefined;
   }
 
-  const raw = await request.text();
-  if (raw.length === 0) {
+  const raw = await readLimitedRequestBody(request, maxRequestBytes);
+  if (raw.byteLength === 0) {
     return undefined;
   }
 
   const contentType = request.headers.get("content-type")?.toLowerCase() ?? "";
-  if (contentType.includes("application/json")) {
+  if (isJsonContentType(contentType)) {
     try {
-      return JSON.parse(raw);
+      return JSON.parse(new TextDecoder().decode(raw));
     } catch {
-      return raw;
+      throw new ApiCliError("BAD_REQUEST", "Request body is not valid JSON");
     }
   }
 
+  if (isTextContentType(contentType)) {
+    return new TextDecoder().decode(raw);
+  }
   return raw;
 }
 
@@ -479,11 +530,11 @@ function parseNodeBody(
     const contentType = headers
       ? (getHeaderValue(headers, "content-type") ?? "").toLowerCase()
       : "";
-    if (contentType.includes("application/json")) {
+    if (isJsonContentType(contentType)) {
       try {
         return JSON.parse(body);
       } catch {
-        return body;
+        throw new ApiCliError("BAD_REQUEST", "Request body is not valid JSON");
       }
     }
   }
@@ -514,7 +565,7 @@ function resolveAuthAdapter(config: ApiProxyServerConfig): AuthAdapter | undefin
   }
 
   if (auth.mode !== "forward-header") {
-    return undefined;
+    throw new Error(`Unsupported auth mode: ${String((auth as { mode?: unknown }).mode)}`);
   }
 
   const sourceHeaderName = auth.sourceHeaderName ?? "authorization";
@@ -588,6 +639,160 @@ function ensureAllowedMethod(method: HttpMethod, config: ApiProxyServerConfig): 
   }
 }
 
+function validateProxyConfig(config: ApiProxyServerConfig): void {
+  const routePrefix = normalizeRoutePrefix(config.routePrefix);
+  validateConfiguredPath(routePrefix, "routePrefix");
+  if (config.allowedMethods !== undefined) {
+    if (config.allowedMethods.length === 0) {
+      throw new Error("allowedMethods cannot be empty");
+    }
+    const methods = new Set<string>();
+    for (const method of config.allowedMethods) {
+      if (!ALL_HTTP_METHODS.includes(method) || methods.has(method)) {
+        throw new Error(`Invalid or duplicate allowed method: ${method}`);
+      }
+      methods.add(method);
+    }
+  }
+  if (
+    config.dangerouslyAllowAnyTargetPath !== true &&
+    !config.allowTargetPath &&
+    (!config.allowedPathPrefixes || config.allowedPathPrefixes.length === 0)
+  ) {
+    throw new Error(
+      "A path policy is required: configure allowedPathPrefixes or allowTargetPath, or explicitly set dangerouslyAllowAnyTargetPath",
+    );
+  }
+  for (const prefix of config.allowedPathPrefixes ?? []) {
+    validateConfiguredPath(prefix, "allowed path prefix");
+  }
+  if ((config.allowedPathPrefixes?.length ?? 0) > 128) {
+    throw new Error("allowedPathPrefixes cannot contain more than 128 entries");
+  }
+  const seenHeaders = new Set<string>();
+  for (const header of config.forwardHeaders ?? []) {
+    const normalized = header.toLowerCase();
+    try {
+      new Headers({ [header]: "value" });
+    } catch {
+      throw new Error(`Invalid forwarded header: ${header}`);
+    }
+    if (FORBIDDEN_TRANSPORT_HEADERS.has(normalized)) {
+      throw new Error(`Forbidden forwarded header: ${header}`);
+    }
+    if (seenHeaders.has(normalized)) {
+      throw new Error(`Duplicate forwarded header: ${header}`);
+    }
+    seenHeaders.add(normalized);
+  }
+  const providerKey = config.providerQueryParam ?? "provider";
+  const pathKey = config.pathQueryParam ?? "path";
+  if (
+    !isSafeQueryKey(providerKey) ||
+    !isSafeQueryKey(pathKey) ||
+    providerKey.toLowerCase() === pathKey.toLowerCase()
+  ) {
+    throw new Error("providerQueryParam and pathQueryParam must be non-empty and distinct");
+  }
+  if (config.defaultProviderId !== undefined && config.defaultProviderId.length > 256) {
+    throw new Error("defaultProviderId cannot exceed 256 characters");
+  }
+  if (config.auth?.mode === "static-bearer") {
+    if (config.auth.token.length === 0) {
+      throw new Error("static bearer token cannot be empty");
+    }
+    validateHeaderName(config.auth.headerName ?? "authorization", "auth header");
+    validateHeaderValue(`${config.auth.scheme ?? "Bearer"} ${config.auth.token}`, "auth value");
+  }
+  if (config.auth?.mode === "forward-header") {
+    const source = config.auth.sourceHeaderName ?? "authorization";
+    validateHeaderName(source, "source auth header");
+    validateHeaderName(config.auth.targetHeaderName ?? source, "target auth header");
+    if (config.auth.passthrough === false) {
+      validateHeaderValue(`${config.auth.scheme ?? "Bearer"} token`, "auth scheme");
+    }
+  }
+}
+
+function isSafeQueryKey(value: string): boolean {
+  return (
+    value.length > 0 &&
+    value.length <= 128 &&
+    !Array.from(value).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x20 || codePoint === 0x7f || character === "&" || character === "=";
+    })
+  );
+}
+
+function validateHeaderName(name: string, label: string): void {
+  try {
+    new Headers({ [name]: "value" });
+  } catch {
+    throw new Error(`Invalid ${label}: ${name}`);
+  }
+}
+
+function validateHeaderValue(value: string, label: string): void {
+  try {
+    new Headers({ "x-apicli-validation": value });
+  } catch {
+    throw new Error(`Invalid ${label}`);
+  }
+}
+
+function validateConfiguredPath(path: string, name: string): void {
+  if (
+    path.length > 2048 ||
+    !path.startsWith("/") ||
+    path.includes("\\") ||
+    path.includes("?") ||
+    path.includes("#")
+  ) {
+    throw new Error(`Invalid ${name}: ${path}`);
+  }
+  for (const rawSegment of path.split("/")) {
+    let segment: string;
+    try {
+      segment = decodeURIComponent(rawSegment);
+    } catch {
+      throw new Error(`Invalid ${name}: ${path}`);
+    }
+    const hasControl = Array.from(segment).some((character) => {
+      const codePoint = character.codePointAt(0) ?? 0;
+      return codePoint <= 0x1f || codePoint === 0x7f;
+    });
+    if (
+      segment === "." ||
+      segment === ".." ||
+      segment.includes("/") ||
+      segment.includes("\\") ||
+      hasControl
+    ) {
+      throw new Error(`Invalid ${name}: ${path}`);
+    }
+  }
+}
+
+function isTargetPathAllowed(
+  config: ApiProxyServerConfig,
+  input: {
+    providerId: string;
+    targetPath: string;
+    method: HttpMethod;
+    context: RequestContext;
+  },
+): boolean {
+  if (config.dangerouslyAllowAnyTargetPath === true) return true;
+  if (config.allowTargetPath && !config.allowTargetPath(input)) return false;
+  const prefixes = config.allowedPathPrefixes;
+  if (!prefixes || prefixes.length === 0) return config.allowTargetPath !== undefined;
+  return prefixes.some(
+    (prefix) =>
+      input.targetPath === prefix || input.targetPath.startsWith(`${prefix.replace(/\/$/, "")}/`),
+  );
+}
+
 function resolveTarget(
   pathname: string,
   query: QueryMultiMap,
@@ -643,6 +848,7 @@ function buildHeaderContextOptions(config: ApiProxyServerConfig): HeaderContextO
 function sendSerializedNodeResponse(
   response: NodeLikeResponse,
   serialized: SerializedResponse,
+  suppressBody = false,
 ): void {
   if (response.status) {
     response.status(serialized.status);
@@ -654,8 +860,17 @@ function sendSerializedNodeResponse(
     response.setHeader?.(key, value);
   }
 
+  if (suppressBody || isBodyForbiddenStatus(serialized.status)) {
+    response.end?.();
+    return;
+  }
+
   const contentType = serialized.headers["content-type"]?.toLowerCase() ?? "";
-  if (contentType.includes("application/json") && response.json) {
+  if (
+    typeof serialized.body === "string" &&
+    contentType.includes("application/json") &&
+    response.json
+  ) {
     try {
       response.json(JSON.parse(serialized.body));
       return;
@@ -672,35 +887,14 @@ function sendSerializedNodeResponse(
   response.end?.(serialized.body);
 }
 
-export interface ApiProxyServer {
-  client: ApiClient;
-  handleWebRequest(request: Request): Promise<Response>;
-  handleNodeRequest(request: NodeLikeRequest): Promise<SerializedResponse>;
-  createExpressMiddleware(): (
-    req: NodeLikeRequest,
-    res: NodeLikeResponse,
-    next?: (error?: unknown) => void,
-  ) => Promise<void>;
-  createFastifyHandler(): (request: NodeLikeRequest, reply: NodeLikeResponse) => Promise<void>;
-  createNestHandler(): (request: NodeLikeRequest, response: NodeLikeResponse) => Promise<void>;
-  createHonoHandler(): (context: { req: { raw: Request } }) => Promise<Response>;
-  createNextRouteHandlers(): {
-    GET: (request: Request) => Promise<Response>;
-    POST: (request: Request) => Promise<Response>;
-    PUT: (request: Request) => Promise<Response>;
-    DELETE: (request: Request) => Promise<Response>;
-    PATCH: (request: Request) => Promise<Response>;
-    HEAD: (request: Request) => Promise<Response>;
-    OPTIONS: (request: Request) => Promise<Response>;
-  };
-}
-
 export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServer {
+  validateProxyConfig(config);
   const clientOptions: {
     providerResolver: ProviderResolver;
     authAdapter?: AuthAdapter;
     fetchImpl?: typeof fetch;
     defaultTimeoutMs?: number;
+    limits?: ApiClientLimits;
   } = {
     providerResolver: resolveProviderResolver(config),
   };
@@ -714,6 +908,9 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
   }
   if (config.defaultTimeoutMs !== undefined) {
     clientOptions.defaultTimeoutMs = config.defaultTimeoutMs;
+  }
+  if (config.limits !== undefined) {
+    clientOptions.limits = config.limits;
   }
 
   const client = new ApiClient(clientOptions);
@@ -740,8 +937,7 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
       );
 
       if (
-        config.allowTargetPath &&
-        !config.allowTargetPath({
+        !isTargetPathAllowed(config, {
           providerId,
           targetPath,
           method,
@@ -777,55 +973,73 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
       const response = await client.call(request);
       return await serializeSuccessResponse(response);
     } catch (error) {
-      return serializeErrorResponse(error);
+      return serializeErrorResponse(error, config.exposeUpstreamErrorDetails === true);
     }
   };
 
   const handleWebRequest = async (request: Request): Promise<Response> => {
-    const url = new URL(request.url);
-    const query = queryMapFromSearchParams(url.searchParams);
+    try {
+      const url = new URL(request.url);
+      const routePrefix = normalizeRoutePrefix(config.routePrefix);
+      if (!isWithinRoutePrefix(url.pathname, routePrefix)) {
+        throw new ApiCliError("BAD_REQUEST", "Request path is outside the proxy route prefix");
+      }
+      const query = queryMapFromSearchParams(url.searchParams);
+      const contextBase = createContextFromWebRequest(request, buildHeaderContextOptions(config));
+      const contextExtra = config.contextResolver
+        ? await config.contextResolver({ kind: "web", request })
+        : undefined;
+      const context = mergeContext(contextBase, contextExtra);
+      const body = await parseWebBody(
+        request,
+        toHttpMethod(request.method) ?? "GET",
+        config.limits?.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES,
+      );
+      const serialized = await executeProxy({
+        method: request.method,
+        pathname: url.pathname,
+        query,
+        headers: request.headers,
+        body,
+        context,
+      });
 
-    const contextBase = createContextFromWebRequest(request, buildHeaderContextOptions(config));
-    const contextExtra = config.contextResolver
-      ? await config.contextResolver({ kind: "web", request })
-      : undefined;
-    const context = mergeContext(contextBase, contextExtra);
-
-    const body = await parseWebBody(request, toHttpMethod(request.method) ?? "GET");
-    const serialized = await executeProxy({
-      method: request.method,
-      pathname: url.pathname,
-      query,
-      headers: request.headers,
-      body,
-      context,
-    });
-
-    return new Response(serialized.body, {
-      status: serialized.status,
-      headers: serialized.headers,
-    });
+      return new Response(webResponseBody(serialized, request.method.toUpperCase() === "HEAD"), {
+        status: serialized.status,
+        headers: serialized.headers,
+      });
+    } catch (error) {
+      const serialized = serializeErrorResponse(error, config.exposeUpstreamErrorDetails === true);
+      return new Response(webResponseBody(serialized, request.method.toUpperCase() === "HEAD"), {
+        status: serialized.status,
+        headers: serialized.headers,
+      });
+    }
   };
 
   const handleNodeRequest = async (request: NodeLikeRequest): Promise<SerializedResponse> => {
-    const method = toHttpMethod(request.method) ?? "GET";
-    const contextBase = createContextFromNodeRequest(
-      { headers: request.headers ?? {} },
-      buildHeaderContextOptions(config),
-    );
-    const contextExtra = config.contextResolver
-      ? await config.contextResolver({ kind: "node", request })
-      : undefined;
-    const context = mergeContext(contextBase, contextExtra);
+    try {
+      const method = toHttpMethod(request.method) ?? "GET";
+      const contextBase = createContextFromNodeRequest(
+        { headers: request.headers ?? {} },
+        buildHeaderContextOptions(config),
+      );
+      const contextExtra = config.contextResolver
+        ? await config.contextResolver({ kind: "node", request })
+        : undefined;
+      const context = mergeContext(contextBase, contextExtra);
 
-    return executeProxy({
-      method: request.method,
-      pathname: nodeRequestPathname(request),
-      query: nodeRequestQuery(request),
-      headers: request.headers ?? {},
-      body: parseNodeBody(request.body, method, request.headers),
-      context,
-    });
+      return executeProxy({
+        method: request.method,
+        pathname: nodeRequestPathname(request),
+        query: nodeRequestQuery(request),
+        headers: request.headers ?? {},
+        body: parseNodeBody(request.body, method, request.headers),
+        context,
+      });
+    } catch (error) {
+      return serializeErrorResponse(error, config.exposeUpstreamErrorDetails === true);
+    }
   };
 
   const createExpressMiddleware = () => {
@@ -836,13 +1050,17 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
     ): Promise<void> => {
       try {
         const serialized = await handleNodeRequest(req);
-        sendSerializedNodeResponse(res, serialized);
+        sendSerializedNodeResponse(res, serialized, req.method?.toUpperCase() === "HEAD");
       } catch (error) {
         if (next) {
           next(error);
           return;
         }
-        sendSerializedNodeResponse(res, serializeErrorResponse(error));
+        sendSerializedNodeResponse(
+          res,
+          serializeErrorResponse(error, config.exposeUpstreamErrorDetails === true),
+          req.method?.toUpperCase() === "HEAD",
+        );
       }
     };
   };
@@ -850,14 +1068,14 @@ export function createApiProxyServer(config: ApiProxyServerConfig): ApiProxyServ
   const createFastifyHandler = () => {
     return async (request: NodeLikeRequest, reply: NodeLikeResponse): Promise<void> => {
       const serialized = await handleNodeRequest(request);
-      sendSerializedNodeResponse(reply, serialized);
+      sendSerializedNodeResponse(reply, serialized, request.method?.toUpperCase() === "HEAD");
     };
   };
 
   const createNestHandler = () => {
     return async (request: NodeLikeRequest, response: NodeLikeResponse): Promise<void> => {
       const serialized = await handleNodeRequest(request);
-      sendSerializedNodeResponse(response, serialized);
+      sendSerializedNodeResponse(response, serialized, request.method?.toUpperCase() === "HEAD");
     };
   };
 

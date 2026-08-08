@@ -1,34 +1,62 @@
 use crate::error::{CliError, Result};
-use crate::infra::db::run_db;
+use crate::infra::db::{enable_wal, run_db, DbConnection, SqlitePool};
 use chrono::Utc;
-use rusqlite::{params, Connection};
-use std::sync::{Arc, Mutex, MutexGuard};
+use r2d2_sqlite::SqliteConnectionManager;
+use rusqlite::{params, Connection, TransactionBehavior};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 const LATEST_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug)]
 pub struct VaultDb {
-    conn: Arc<Mutex<Connection>>,
+    connections: VaultConnections,
+}
+
+#[derive(Clone, Debug)]
+enum VaultConnections {
+    Single(Arc<Mutex<Connection>>),
+    Pool(SqlitePool),
 }
 
 impl VaultDb {
     pub fn new(mut conn: Connection) -> Result<Self> {
         Self::migrate(&mut conn)?;
         Ok(Self {
-            conn: Arc::new(Mutex::new(conn)),
+            connections: VaultConnections::Single(Arc::new(Mutex::new(conn))),
+        })
+    }
+
+    pub fn open(path: &Path) -> Result<Self> {
+        let manager = SqliteConnectionManager::file(path)
+            .with_init(|connection| connection.execute_batch("PRAGMA busy_timeout = 5000;"));
+        let pool = r2d2::Pool::builder()
+            .max_size(4)
+            .connection_timeout(std::time::Duration::from_secs(5))
+            .build(manager)
+            .map_err(|error| CliError::Internal(format!("vault database pool: {error}")))?;
+        {
+            let mut connection = pool
+                .get()
+                .map_err(|error| CliError::Internal(format!("vault database pool: {error}")))?;
+            Self::migrate(&mut connection)?;
+        }
+        Ok(Self {
+            connections: VaultConnections::Pool(pool),
         })
     }
 
     fn migrate(conn: &mut Connection) -> Result<()> {
         conn.execute_batch(
-            "PRAGMA journal_mode = DELETE;
-             PRAGMA busy_timeout = 5000;
+            "PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS schema_version (
                  version INTEGER PRIMARY KEY,
                  applied_at TEXT NOT NULL
              );",
         )?;
-        let current: i64 = conn.query_row(
+        enable_wal(conn)?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: i64 = tx.query_row(
             "SELECT COALESCE(MAX(version), 0) FROM schema_version",
             [],
             |row| row.get(0),
@@ -41,7 +69,6 @@ impl VaultDb {
             });
         }
         if current < 1 {
-            let tx = conn.transaction()?;
             tx.execute_batch(
                 "CREATE TABLE IF NOT EXISTS secrets (
                      secret_id TEXT PRIMARY KEY,
@@ -56,15 +83,22 @@ impl VaultDb {
                 "INSERT INTO schema_version (version, applied_at) VALUES (?1, ?2)",
                 params![1_i64, Utc::now().to_rfc3339()],
             )?;
-            tx.commit()?;
         }
+        tx.commit()?;
         Ok(())
     }
 
-    fn connection(&self) -> Result<MutexGuard<'_, Connection>> {
-        self.conn
-            .lock()
-            .map_err(|_| CliError::Internal("Vault database lock poisoned".into()))
+    fn connection(&self) -> Result<DbConnection<'_>> {
+        match &self.connections {
+            VaultConnections::Single(connection) => connection
+                .lock()
+                .map(DbConnection::Single)
+                .map_err(|_| CliError::Internal("Vault database lock poisoned".into())),
+            VaultConnections::Pool(pool) => pool
+                .get()
+                .map(DbConnection::Pooled)
+                .map_err(|error| CliError::Internal(format!("vault database pool: {error}"))),
+        }
     }
 
     #[cfg(test)]
@@ -129,6 +163,16 @@ impl VaultDb {
             Ok(())
         })
     }
+
+    pub fn has_secrets(&self) -> Result<bool> {
+        run_db(|| {
+            self.connection()?
+                .query_row("SELECT EXISTS(SELECT 1 FROM secrets LIMIT 1)", [], |row| {
+                    row.get(0)
+                })
+                .map_err(Into::into)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -144,8 +188,10 @@ mod tests {
     #[test]
     fn insert_and_get_secret_roundtrip() {
         let db = setup_db();
+        assert!(!db.has_secrets().expect("empty vault"));
         db.insert_secret("s1", "api_key", b"cipher", b"nonce")
             .expect("insert secret");
+        assert!(db.has_secrets().expect("nonempty vault"));
 
         let found = db.get_secret("s1").expect("get secret");
         assert_eq!(found, Some((b"cipher".to_vec(), b"nonce".to_vec())));
@@ -203,5 +249,59 @@ mod tests {
 
         let err = VaultDb::new(conn).expect_err("newer schema must be rejected");
         assert!(matches!(err, CliError::UnsupportedSchemaVersion { .. }));
+    }
+
+    #[test]
+    fn file_database_pool_supports_concurrent_secret_writers() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let db = VaultDb::open(&directory.path().join("vault.db")).expect("open pool");
+        let handles = (0..8)
+            .map(|index| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    let secret_id = format!("secret-{index}");
+                    db.insert_secret(
+                        &secret_id,
+                        "api_key",
+                        format!("cipher-{index}").as_bytes(),
+                        b"123456789012",
+                    )
+                    .expect("insert secret");
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().expect("writer thread");
+        }
+        for index in 0..8 {
+            assert!(db
+                .get_secret(&format!("secret-{index}"))
+                .expect("read secret")
+                .is_some());
+        }
+    }
+
+    #[test]
+    fn concurrent_database_open_serializes_migrations() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let path = std::sync::Arc::new(directory.path().join("vault.db"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    VaultDb::open(path.as_ref()).expect("concurrent database open")
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            let db = handle.join().expect("open thread");
+            assert_eq!(
+                db.schema_version().expect("schema version"),
+                LATEST_SCHEMA_VERSION
+            );
+        }
     }
 }

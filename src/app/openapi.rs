@@ -11,6 +11,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
+const MAX_IMPORTED_OPERATIONS: usize = 512;
+const MAX_GENERATED_ACTION_BYTES: usize = 1024 * 1024;
 
 pub fn validate_document(path: &Path) -> Result<usize> {
     let operations = parse_operations(path)?;
@@ -62,16 +64,32 @@ pub fn import_document(path: &Path, provider: &str, output_dir: &Path) -> Result
         let target = output_dir.join(format!("{safe_name}.yaml"));
         let bytes = serde_yaml::to_string(&action)
             .map_err(|error| CliError::InvalidAction(error.to_string()))?;
+        if bytes.len() > MAX_GENERATED_ACTION_BYTES {
+            return Err(CliError::InvalidAction(format!(
+                "generated ActionDefinition {} exceeds 1 MiB",
+                action.metadata.name
+            )));
+        }
         serialized.push((target, bytes));
     }
     let mut output = Vec::new();
     for (target, bytes) in serialized {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&target)?;
-        file.write_all(bytes.as_bytes())?;
-        file.sync_all()?;
+        let write_result = (|| -> Result<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&target)?;
+            file.write_all(bytes.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&target);
+            for created in &output {
+                let _ = fs::remove_file(created);
+            }
+            return Err(error);
+        }
         output.push(target);
     }
     if output.is_empty() {
@@ -207,6 +225,11 @@ fn parse_operations(path: &Path) -> Result<Vec<ActionDefinition>> {
                     constraints: ActionConstraints::default(),
                 },
             });
+            if actions.len() > MAX_IMPORTED_OPERATIONS {
+                return Err(CliError::InvalidAction(format!(
+                    "OpenAPI document exceeds the {MAX_IMPORTED_OPERATIONS} operation import limit"
+                )));
+            }
         }
     }
     Ok(actions)
@@ -380,6 +403,11 @@ fn resolve_ref<'a>(value: &'a Value, document: &'a Value) -> Result<&'a Value> {
                 "recursive OpenAPI reference is not supported: {reference}"
             )));
         }
+        if seen.len() > 64 {
+            return Err(CliError::InvalidAction(
+                "OpenAPI reference chain exceeds 64 levels".into(),
+            ));
+        }
         current = document.pointer(&reference[1..]).ok_or_else(|| {
             CliError::InvalidAction(format!("unresolved OpenAPI reference: {reference}"))
         })?;
@@ -387,12 +415,22 @@ fn resolve_ref<'a>(value: &'a Value, document: &'a Value) -> Result<&'a Value> {
 }
 
 fn dereference_schema(schema: &Value, document: &Value) -> Result<Value> {
+    let initial_size = serde_json::to_vec(schema)
+        .map_err(|error| CliError::InvalidAction(format!("OpenAPI schema: {error}")))?
+        .len();
+    if initial_size > MAX_GENERATED_ACTION_BYTES {
+        return Err(CliError::InvalidAction(
+            "OpenAPI schema exceeds the 1 MiB expansion limit".into(),
+        ));
+    }
     let mut cloned = schema.clone();
+    let mut remaining_expansion_bytes = MAX_GENERATED_ACTION_BYTES - initial_size;
     inline_refs(
         &mut cloned,
         document,
         0,
         &mut std::collections::BTreeSet::new(),
+        &mut remaining_expansion_bytes,
     )?;
     Ok(cloned)
 }
@@ -402,6 +440,7 @@ fn inline_refs(
     document: &Value,
     depth: usize,
     stack: &mut std::collections::BTreeSet<String>,
+    remaining_expansion_bytes: &mut usize,
 ) -> Result<()> {
     if depth > 64 {
         return Err(CliError::InvalidAction(
@@ -426,6 +465,14 @@ fn inline_refs(
         let resolved = document.pointer(&reference[1..]).ok_or_else(|| {
             CliError::InvalidAction(format!("unresolved OpenAPI reference: {reference}"))
         })?;
+        let resolved_size = serde_json::to_vec(resolved)
+            .map_err(|error| CliError::InvalidAction(format!("OpenAPI schema: {error}")))?
+            .len();
+        *remaining_expansion_bytes = remaining_expansion_bytes
+            .checked_sub(resolved_size)
+            .ok_or_else(|| {
+                CliError::InvalidAction("OpenAPI schema exceeds the 1 MiB expansion limit".into())
+            })?;
         let siblings = value
             .as_object()
             .into_iter()
@@ -443,19 +490,19 @@ fn inline_refs(
                 ]
             })
         };
-        inline_refs(value, document, depth + 1, stack)?;
+        inline_refs(value, document, depth + 1, stack, remaining_expansion_bytes)?;
         stack.remove(&reference);
         return Ok(());
     }
     match value {
         Value::Object(object) => {
             for child in object.values_mut() {
-                inline_refs(child, document, depth + 1, stack)?;
+                inline_refs(child, document, depth + 1, stack, remaining_expansion_bytes)?;
             }
         }
         Value::Array(array) => {
             for child in array {
-                inline_refs(child, document, depth + 1, stack)?;
+                inline_refs(child, document, depth + 1, stack, remaining_expansion_bytes)?;
             }
         }
         _ => {}

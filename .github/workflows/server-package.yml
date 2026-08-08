@@ -1,20 +1,30 @@
 name: server-package
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     paths:
       - 'server/**'
+      - 'README.md'
+      - 'docs/**'
       - '.github/workflows/server-package.yml'
   push:
     branches:
       - main
     paths:
       - 'server/**'
+      - 'README.md'
+      - 'docs/**'
       - '.github/workflows/server-package.yml'
 
 jobs:
   verify-server-package:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20, 22]
     defaults:
       run:
         working-directory: server
@@ -25,18 +35,18 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
           cache: npm
           cache-dependency-path: server/package-lock.json
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Typecheck
-        run: npm run typecheck
+      - name: Verify
+        run: npm run verify
 
-      - name: Test
-        run: npm test
+      - name: Audit dependencies
+        run: npm audit
 
-      - name: Build
-        run: npm run build
+      - name: Verify package contents
+        run: npm pack --dry-run
